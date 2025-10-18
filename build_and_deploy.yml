@@ -1,8 +1,8 @@
 ---
 - hosts: servers
   vars:
-    target_bin: "/usr/local/bin/dns_proxy"
-    target_config: "/etc/dnsproxy.yml"
+    target_bin: "/usr/local/bin/dns_filter"
+    target_config: "/etc/dnsfilter.yml"
   vars_prompt:
     - name: "wg_required"
       prompt: "Is WireGuard requirement needed? (yes/no)"
@@ -28,7 +28,7 @@
 
     - name: Build the Linux binary
       command:
-        cmd: go build -a -installsuffix cgo -o dns_proxy_linux
+        cmd: go build -a -installsuffix cgo -o dns_filter_linux
         chdir: service
       environment:
         GOOS: linux
@@ -38,14 +38,14 @@
 
     - name: Stop old service
       systemd:
-        name: dns-proxy
+        name: dns-filter
         state: stopped
-      ignore_errors: yes 
+      ignore_errors: yes
 
     - name: Uninstall old service
       command:
         cmd: "{{ target_bin }} -service uninstall"
-      ignore_errors: yes 
+      ignore_errors: yes
 
     - name: Remove the old binary
       file:
@@ -54,34 +54,34 @@
 
     - name: Upload the new binary
       copy:
-        src: service/dns_proxy_linux
+        src: service/dns_filter_linux
         dest: "{{ target_bin }}"
-        mode: '0755'
+        mode: "0755"
 
     - name: Upload the new configuration
       copy:
         src: config.yml
         dest: "{{ target_config }}"
-        mode: '0644'
+        mode: "0644"
 
-    - name: Create dnsproxy group
+    - name: Create dnsfilter group
       group:
-        name: dnsproxy
+        name: dnsfilter
         state: present
 
-    - name: Create dnsproxy user
+    - name: Create dnsfilter user
       user:
-        name: dnsproxy
-        group: dnsproxy
+        name: dnsfilter
+        group: dnsfilter
         system: yes
         shell: /bin/false
 
     - name: Set permissions on binary and config
       file:
         path: "{{ item }}"
-        owner: dnsproxy
-        group: dnsproxy
-        mode: '0755'
+        owner: dnsfilter
+        group: dnsfilter
+        mode: "0755"
       loop:
         - "{{ target_bin }}"
         - "{{ target_config }}"
@@ -96,7 +96,7 @@
         rule: allow
         direction: in
         interface: wg0
-        port: '53'
+        port: "53"
         proto: udp
       become: yes
       when: wg_required == 'yes'
@@ -107,12 +107,12 @@
 
     - name: Start new service
       systemd:
-        name: dns-proxy
+        name: dns-filter
         state: started
 
     - name: Check service status
       systemd:
-        name: dns-proxy
+        name: dns-filter
         state: started
         daemon_reload: yes
       register: service_status
@@ -122,6 +122,6 @@
 
     - name: Remove local binary
       file:
-        path: service/dns_proxy_linux
+        path: service/dns_filter_linux
         state: absent
       delegate_to: localhost

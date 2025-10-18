@@ -1,4 +1,3 @@
-// ==== File: service/service_test.go ====
 package main
 
 import (
@@ -7,17 +6,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dryaf/dnsproxy/lib"
+	"github.com/dryaf/dnsfilter/lib"
 	"github.com/kardianos/service"
 )
 
-// mockProxy implements the lib.Proxy interface for testing.
-type mockProxy struct {
+// mockFilter implements the lib.Proxy interface for testing.
+type mockFilter struct {
 	runFunc   func() error
 	runCalled chan struct{}
 }
 
-func (m *mockProxy) Run() error {
+func (m *mockFilter) Run() error {
 	if m.runCalled != nil {
 		close(m.runCalled)
 	}
@@ -65,13 +64,13 @@ func setupTestMain(t *testing.T) {
 	// Keep original functions
 	originalServiceNew := serviceNew
 	originalServiceControl := serviceControl
-	originalNewProxy := newProxy
+	originalNewFilter := newFilter
 
 	// Restore original functions after the test
 	t.Cleanup(func() {
 		serviceNew = originalServiceNew
 		serviceControl = originalServiceControl
-		newProxy = originalNewProxy
+		newFilter = originalNewFilter
 	})
 }
 
@@ -175,14 +174,14 @@ func TestProgramStartAndStop(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	mockPxy := &mockProxy{
+	mockFlt := &mockFilter{
 		runFunc: func() error {
 			wg.Done() // Signal that run has started
 			return nil
 		},
 	}
-	newProxy = func(configFile, listenAddr string) (lib.Proxy, error) {
-		return mockPxy, nil
+	newFilter = func(configFile, listenAddr string) (lib.Proxy, error) {
+		return mockFlt, nil
 	}
 
 	p := &program{}

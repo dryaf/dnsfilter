@@ -1,11 +1,10 @@
-// ==== File: service/service.go ====
 package main
 
 import (
 	"flag"
 	"os"
 
-	"github.com/dryaf/dnsproxy/lib"
+	"github.com/dryaf/dnsfilter/lib"
 	"github.com/kardianos/service"
 	"golang.org/x/exp/slog"
 )
@@ -15,18 +14,18 @@ var (
 	serviceNew     = service.New
 	serviceControl = service.Control
 
-	// newProxy creates the proxy instance. It's a variable for mocking.
-	newProxy = func(configFile, listenAddr string) (lib.Proxy, error) {
-		return lib.NewDNSProxy(configFile, listenAddr)
+	// newFilter creates the filter instance. It's a variable for mocking.
+	newFilter = func(configFile, listenAddr string) (lib.Proxy, error) {
+		return lib.NewDNSFilter(configFile, listenAddr)
 	}
 )
 
 var serviceConfig = &service.Config{
-	Name:        "dns-proxy",
-	DisplayName: "dns-proxy",
+	Name:        "dns-filter",
+	DisplayName: "dns-filter",
 	Description: "This is a DNS-Server that filters malware, porn and ads.",
-	UserName:    "dnsproxy",
-	Arguments:   []string{"-configFile", "/etc/dnsproxy.yml"},
+	UserName:    "dnsfilter",
+	Arguments:   []string{"-configFile", "/etc/dnsfilter.yml"},
 }
 
 func main() {
@@ -39,7 +38,7 @@ func main() {
 
 // runMain contains the core logic of the main function and is testable.
 func runMain(args []string) error {
-	flags := flag.NewFlagSet("dnsproxy", flag.ExitOnError)
+	flags := flag.NewFlagSet("dnsfilter", flag.ExitOnError)
 	configFile := flags.String("configFile", "", "Provide a yaml file.")
 	listenAddr := flags.String("listenAddress", "", "sample: 127.0.0.1:5300, this overrides the one in the config")
 	svcFlag := flags.String("service", "", "Control the system service.")
@@ -88,13 +87,13 @@ func (p *program) Start(s service.Service) error {
 }
 
 func (p *program) run() {
-	dns, err := newProxy(p.configFile, p.listenAddr)
+	dns, err := newFilter(p.configFile, p.listenAddr)
 	if err != nil {
-		slog.Error("dnsproxy", err)
+		slog.Error("dnsfilter", err)
 		return
 	}
 	if err = dns.Run(); err != nil {
-		slog.Error("dnsproxy", err)
+		slog.Error("dnsfilter", err)
 	}
 }
 

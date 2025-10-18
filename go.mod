@@ -1,4 +1,4 @@
-module github.com/dryaf/dnsproxy
+module github.com/dryaf/dnsfilter
 
 go 1.25.3
 
