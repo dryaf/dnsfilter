@@ -1,0 +1,127 @@
+---
+- hosts: servers
+  vars:
+    target_bin: "/usr/local/bin/dns_proxy"
+    target_config: "/etc/dnsproxy.yml"
+  vars_prompt:
+    - name: "wg_required"
+      prompt: "Is WireGuard requirement needed? (yes/no)"
+      private: no
+      default: "no"
+  tasks:
+    - name: Set install command
+      set_fact:
+        install_cmd: "{{ target_bin }} -service install {{ '-wg' if wg_required == 'yes' else '' }}"
+
+    - name: Stop systemd-resolved service
+      systemd:
+        name: systemd-resolved
+        state: stopped
+      become: yes
+      when: wg_required == 'no'
+
+    - name: Disable systemd-resolved service
+      systemd:
+        name: systemd-resolved
+        enabled: no
+      become: yes
+
+    - name: Build the Linux binary
+      command:
+        cmd: go build -a -installsuffix cgo -o dns_proxy_linux
+        chdir: service
+      environment:
+        GOOS: linux
+        CGO_ENABLED: 0
+        GOARCH: amd64
+      delegate_to: localhost
+
+    - name: Stop old service
+      systemd:
+        name: dns-proxy
+        state: stopped
+      ignore_errors: yes 
+
+    - name: Uninstall old service
+      command:
+        cmd: "{{ target_bin }} -service uninstall"
+      ignore_errors: yes 
+
+    - name: Remove the old binary
+      file:
+        path: "{{ target_bin }}"
+        state: absent
+
+    - name: Upload the new binary
+      copy:
+        src: service/dns_proxy_linux
+        dest: "{{ target_bin }}"
+        mode: '0755'
+
+    - name: Upload the new configuration
+      copy:
+        src: config.yml
+        dest: "{{ target_config }}"
+        mode: '0644'
+
+    - name: Create dnsproxy group
+      group:
+        name: dnsproxy
+        state: present
+
+    - name: Create dnsproxy user
+      user:
+        name: dnsproxy
+        group: dnsproxy
+        system: yes
+        shell: /bin/false
+
+    - name: Set permissions on binary and config
+      file:
+        path: "{{ item }}"
+        owner: dnsproxy
+        group: dnsproxy
+        mode: '0755'
+      loop:
+        - "{{ target_bin }}"
+        - "{{ target_config }}"
+
+    - name: Set capabilities on binary
+      ansible.builtin.command:
+        cmd: setcap 'cap_net_bind_service=+ep' "{{ target_bin }}"
+      become: yes
+
+    - name: Open port 53 on wg0 for DNS
+      ansible.builtin.ufw:
+        rule: allow
+        direction: in
+        interface: wg0
+        port: '53'
+        proto: udp
+      become: yes
+      when: wg_required == 'yes'
+
+    - name: Install new service
+      command:
+        cmd: "{{ install_cmd }}"
+
+    - name: Start new service
+      systemd:
+        name: dns-proxy
+        state: started
+
+    - name: Check service status
+      systemd:
+        name: dns-proxy
+        state: started
+        daemon_reload: yes
+      register: service_status
+
+    - debug:
+        var: service_status
+
+    - name: Remove local binary
+      file:
+        path: service/dns_proxy_linux
+        state: absent
+      delegate_to: localhost

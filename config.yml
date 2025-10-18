@@ -1,0 +1,29 @@
+listen_addr: 10.99.0.1:53
+
+filter_malware: true
+filter_porn: true
+filter_ads: true
+
+whitelist: 
+  - yts.mx
+  - piratebay.org
+
+resolver_unfiltered:
+  name: cloudflare-dns.com
+  addr: 1.1.1.1:443
+  url: https://1.1.1.1/dns-query
+
+resolver_anti_malware:
+  name: cloudflare-dns.com
+  addr: 1.1.1.2:443
+  url: https://1.1.1.2/dns-query
+
+resolver_anti_porn:
+  name: cloudflare-dns.com
+  addr: 1.1.1.3:443
+  url: https://1.1.1.3/dns-query
+
+resolver_anti_ads:
+  name: dns.adguard-dns.com
+  addr: 94.140.15.15:853
+  url: https://dns.adguard-dns.com/dns-query
