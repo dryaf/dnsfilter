@@ -1,127 +1,148 @@
 ---
 - hosts: servers
   vars:
-    target_bin: "/usr/local/bin/dns_filter"
-    target_config: "/etc/dnsfilter.yml"
+    # --- Project Variables ---
+    # Define all names and paths in one place for easy maintenance.
+    service_name: "dns-filter"
+    service_user: "dnsfilter"
+    service_group: "dnsfilter"
+    binary_name: "dns_filter"
+
+    # --- Target Paths ---
+    target_bin: "/usr/local/bin/{{ binary_name }}"
+    target_config: "/etc/{{ service_user }}.yml"
+
+    # --- Local Paths ---
+    local_binary_path: "service/{{ binary_name }}_linux"
+
   vars_prompt:
     - name: "wg_required"
       prompt: "Is WireGuard requirement needed? (yes/no)"
       private: no
       default: "no"
+
   tasks:
     - name: Set install command
       set_fact:
         install_cmd: "{{ target_bin }} -service install {{ '-wg' if wg_required == 'yes' else '' }}"
 
     - name: Stop systemd-resolved service
+      become: yes
       systemd:
         name: systemd-resolved
         state: stopped
-      become: yes
       when: wg_required == 'no'
 
     - name: Disable systemd-resolved service
+      become: yes
       systemd:
         name: systemd-resolved
         enabled: no
-      become: yes
 
     - name: Build the Linux binary
+      delegate_to: localhost
       command:
-        cmd: go build -a -installsuffix cgo -o dns_filter_linux
+        cmd: "go build -a -installsuffix cgo -o {{ binary_name }}_linux"
         chdir: service
       environment:
         GOOS: linux
         CGO_ENABLED: 0
         GOARCH: amd64
-      delegate_to: localhost
 
     - name: Stop old service
+      become: yes
       systemd:
-        name: dns-filter
+        name: "{{ service_name }}"
         state: stopped
       ignore_errors: yes
 
     - name: Uninstall old service
+      become: yes
       command:
         cmd: "{{ target_bin }} -service uninstall"
       ignore_errors: yes
 
     - name: Remove the old binary
+      become: yes
       file:
         path: "{{ target_bin }}"
         state: absent
 
     - name: Upload the new binary
+      become: yes
       copy:
-        src: service/dns_filter_linux
+        src: "{{ local_binary_path }}"
         dest: "{{ target_bin }}"
         mode: "0755"
 
     - name: Upload the new configuration
+      become: yes
       copy:
         src: config.yml
         dest: "{{ target_config }}"
         mode: "0644"
 
-    - name: Create dnsfilter group
+    - name: Create {{ service_group }} group
+      become: yes
       group:
-        name: dnsfilter
+        name: "{{ service_group }}"
         state: present
 
-    - name: Create dnsfilter user
+    - name: Create {{ service_user }} user
+      become: yes
       user:
-        name: dnsfilter
-        group: dnsfilter
+        name: "{{ service_user }}"
+        group: "{{ service_group }}"
         system: yes
         shell: /bin/false
 
     - name: Set permissions on binary and config
+      become: yes
       file:
         path: "{{ item }}"
-        owner: dnsfilter
-        group: dnsfilter
+        owner: "{{ service_user }}"
+        group: "{{ service_group }}"
         mode: "0755"
       loop:
         - "{{ target_bin }}"
         - "{{ target_config }}"
 
     - name: Set capabilities on binary
-      ansible.builtin.command:
-        cmd: setcap 'cap_net_bind_service=+ep' "{{ target_bin }}"
       become: yes
+      ansible.builtin.command:
+        cmd: "setcap 'cap_net_bind_service=+ep' {{ target_bin }}"
+      changed_when: false # This command is idempotent but ansible doesn't know that.
 
     - name: Open port 53 on wg0 for DNS
+      become: yes
       ansible.builtin.ufw:
         rule: allow
         direction: in
         interface: wg0
         port: "53"
         proto: udp
-      become: yes
       when: wg_required == 'yes'
 
     - name: Install new service
+      become: yes
       command:
         cmd: "{{ install_cmd }}"
 
-    - name: Start new service
+    - name: Start and enable new service
+      become: yes
       systemd:
-        name: dns-filter
+        name: "{{ service_name }}"
         state: started
-
-    - name: Check service status
-      systemd:
-        name: dns-filter
-        state: started
+        enabled: yes
         daemon_reload: yes
       register: service_status
 
-    - debug:
+    - name: Display service status
+      debug:
         var: service_status
 
     - name: Remove local binary
-      file:
-        path: service/dns_filter_linux
-        state: absent
       delegate_to: localhost
+      file:
+        path: "{{ local_binary_path }}"
+        state: absent
