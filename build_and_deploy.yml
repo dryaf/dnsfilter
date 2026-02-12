@@ -1,6 +1,6 @@
 ---
 - hosts: all
-  gather_facts: no
+  gather_facts: yes
   vars:
     # --- Project Variables ---
     service_name: "dns-filter"
@@ -12,20 +12,53 @@
     target_bin: "/usr/local/bin/{{ binary_name }}"
     target_bin_tmp: "/usr/local/bin/{{ binary_name }}.new"
     target_config: "/etc/dnsfilter.yml"
+    target_service_file: "/etc/systemd/system/{{ service_name }}.service"
 
     # --- Local Paths ---
     local_binary_path: "service/{{ binary_name }}_linux"
 
     # --- Feature Flags ---
-    wg_required: "no"
-    # Set this to "yes" if you want the server to use ITSELF for DNS.
-    # WARNING: Requires the Go code to strictly use `transport.DialContext` to avoid loops.
+    # "auto" will enable UFW rules if 'wg0' interface is found.
+    wg_required: "auto"
     use_local_dns: "yes"
 
   tasks:
+    # --- Connectivity Bootstrap ---
+    - name: Temporarily set valid DNS for installation
+      become: yes
+      copy:
+        content: "nameserver 1.1.1.1\n"
+        dest: /etc/resolv.conf
+        mode: '0644'
+
+    # --- Dependency Checks ---
+    - name: Ensure required system packages are installed
+      become: yes
+      package:
+        name:
+          - ufw
+          - libcap2-bin # Required for setcap
+        state: present
+        update_cache: yes # Ensure apt cache is fresh
+
+    # --- Feature Detection ---
+    - name: Detect WireGuard interface
+      set_fact:
+        wg_enabled: "{{ 'wg0' in ansible_facts['interfaces'] }}"
+      when: wg_required == "auto"
+
+    - name: Force WireGuard setting
+      set_fact:
+        wg_enabled: "{{ wg_required | bool }}"
+      when: wg_required != "auto"
+
+    - name: Display WireGuard status
+      debug:
+        msg: "WireGuard support enabled: {{ wg_enabled }}"
+
     - name: Set install command
       set_fact:
-        install_cmd: "{{ target_bin }} -service install {{ '-wg' if wg_required == 'yes' else '' }}"
+        install_cmd: "{{ target_bin }} -service install {{ '-wg' if wg_enabled else '' }}"
 
     # --- Build Phase (Local) ---
     - name: Build the Linux binary
@@ -57,12 +90,18 @@
         owner: root
         group: root
 
+    # --- Graceful Stop ---
+    - name: Check if service exists
+      stat:
+        path: "{{ target_service_file }}"
+      register: service_file
+
     - name: Stop old service
       become: yes
       systemd:
         name: "{{ service_name }}"
         state: stopped
-      ignore_errors: yes
+      when: service_file.stat.exists
 
     - name: Atomic move of new binary
       become: yes
@@ -112,7 +151,7 @@
         interface: wg0
         port: "53"
         proto: udp
-      when: wg_required == 'yes'
+      when: wg_enabled
 
     - name: Configure resolv.conf
       become: yes
@@ -128,7 +167,7 @@
         cmd: "{{ install_cmd }}"
       register: install_result
       changed_when: "'already installed' not in install_result.stderr"
-      failed_when: false # Ignore if already installed
+      failed_when: false
 
     - name: Start and enable new service
       become: yes
