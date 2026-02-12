@@ -1,11 +1,13 @@
 package lib
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -118,6 +120,14 @@ resolver_anti_ads:
 			wantBlock:  false,
 			wantResult: "93.184.216.34",
 		},
+		{
+			name:   "Non-FQDN whitelist in config (FQDN Normalization check)",
+			domain: "thepiratebay.org.",
+			// Config defines whitelist without trailing dot
+			configExt:  "whitelist:\n  - \"thepiratebay.org\"\nfilter_malware: true",
+			wantBlock:  false,
+			wantResult: "93.184.216.34",
+		},
 	}
 
 	logger := slog.Default()
@@ -209,14 +219,6 @@ resolver_anti_ads:
 		})
 
 		msg, err := filter.ResolveDomain(context.Background(), "test.com.", 1, logger)
-		// Current logic: If primary fails, but ads succeeds and returns a valid IP (not blocked),
-		// it might return that or the error.
-		// Looking at resolveConcurrently:
-		// - If ads returns valid msg (not blocked), we check primary.
-		// - If primary err != nil and Ads msg != nil -> Returns Ads msg?
-		// Let's check logic: "if rPrimary.err != nil { return nil, rPrimary.err }"
-		// So actually, if primary fails, we return error, IGNORING ads success.
-		// This confirms the behavior we expect (Fail fast on primary).
 
 		if err == nil {
 			t.Error("Expected error from primary resolver")
@@ -225,6 +227,41 @@ resolver_anti_ads:
 			t.Error("Expected nil message")
 		}
 	})
+}
+
+func TestWhitelistLogging(t *testing.T) {
+	// Capture logs to a buffer
+	var buf bytes.Buffer
+	handler := slog.NewJSONHandler(&buf, nil)
+	logger := slog.New(handler)
+
+	mockUnfiltered := &mockDNSClient{Handler: handlerPass}
+	config := `
+listen_addr: "127.0.0.1:53"
+whitelist:
+  - "logme.com"
+resolver_unfiltered:
+  name: "super-secure-resolver"
+  addr: "1.1.1.1:53"
+`
+	filter := newTestFilterWithMocks(t, config, map[string]dnsExchanger{
+		"resolver_unfiltered": mockUnfiltered,
+	})
+
+	// Resolve a whitelisted domain
+	_, err := filter.ResolveDomain(context.Background(), "logme.com.", 1, logger)
+	if err != nil {
+		t.Fatalf("ResolveDomain failed: %v", err)
+	}
+
+	// Verify log output
+	logOutput := buf.String()
+	if !strings.Contains(logOutput, "domain is whitelisted") {
+		t.Errorf("Log should contain 'domain is whitelisted', got: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, "\"resolver\":\"super-secure-resolver\"") {
+		t.Errorf("Log should contain resolver name, got: %s", logOutput)
+	}
 }
 
 func TestCacheIntegration(t *testing.T) {

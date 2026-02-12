@@ -12,14 +12,10 @@ import (
 
 // mockFilter implements the lib.Proxy interface for testing.
 type mockFilter struct {
-	runFunc   func() error
-	runCalled chan struct{}
+	runFunc func() error
 }
 
 func (m *mockFilter) Run() error {
-	if m.runCalled != nil {
-		close(m.runCalled)
-	}
 	if m.runFunc != nil {
 		return m.runFunc()
 	}
@@ -28,16 +24,12 @@ func (m *mockFilter) Run() error {
 
 // mockService is a complete and correct implementation of the service.Service interface for testing.
 type mockService struct {
-	runFunc   func() error
 	runCalled chan struct{}
 }
 
 func (m *mockService) Run() error {
 	if m.runCalled != nil {
 		close(m.runCalled)
-	}
-	if m.runFunc != nil {
-		return m.runFunc()
 	}
 	return nil
 }
@@ -173,33 +165,28 @@ func TestProgramRunErrors(t *testing.T) {
 	p := &program{configFile: "config.yml"}
 
 	t.Run("newFilter fails", func(t *testing.T) {
-		var wg sync.WaitGroup
-		wg.Add(1)
-
+		called := make(chan struct{})
+		var once sync.Once
 		newFilter = func(configFile, listenAddr string) (lib.Proxy, error) {
-			defer wg.Done()
+			once.Do(func() { close(called) })
 			return nil, errors.New("config error")
 		}
 
-		// Run directly, not via Start
 		go p.run()
 
-		c := make(chan struct{})
-		go func() { wg.Wait(); close(c) }()
 		select {
-		case <-c:
+		case <-called:
 		case <-time.After(100 * time.Millisecond):
 			t.Fatal("timeout waiting for newFilter to fail")
 		}
 	})
 
 	t.Run("dns.Run fails", func(t *testing.T) {
-		var wg sync.WaitGroup
-		wg.Add(1)
-
+		called := make(chan struct{})
+		var once sync.Once
 		mockFlt := &mockFilter{
 			runFunc: func() error {
-				defer wg.Done()
+				once.Do(func() { close(called) })
 				return errors.New("run error")
 			},
 		}
@@ -209,10 +196,8 @@ func TestProgramRunErrors(t *testing.T) {
 
 		go p.run()
 
-		c := make(chan struct{})
-		go func() { wg.Wait(); close(c) }()
 		select {
-		case <-c:
+		case <-called:
 		case <-time.After(100 * time.Millisecond):
 			t.Fatal("timeout waiting for dns.Run to fail")
 		}
@@ -221,12 +206,12 @@ func TestProgramRunErrors(t *testing.T) {
 
 func TestProgramStartAndStop(t *testing.T) {
 	setupTestMain(t)
-	var wg sync.WaitGroup
-	wg.Add(1)
+	runCalled := make(chan struct{})
+	var once sync.Once
 
 	mockFlt := &mockFilter{
 		runFunc: func() error {
-			wg.Done() // Signal that run has started
+			once.Do(func() { close(runCalled) })
 			return nil
 		},
 	}
@@ -239,14 +224,8 @@ func TestProgramStartAndStop(t *testing.T) {
 		t.Fatalf("p.Start() returned an error: %v", err)
 	}
 
-	waitCh := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(waitCh)
-	}()
-
 	select {
-	case <-waitCh:
+	case <-runCalled:
 		// test passed
 	case <-time.After(1 * time.Second):
 		t.Fatal("timed out waiting for program.run to be called")

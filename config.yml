@@ -1,6 +1,5 @@
-#listen_addr: 10.99.0.1:53 # github.com/dryaf/wireguard
-listen_addr: 127.0.0.1:53
-metrics_addr: 127.0.0.1:8080 # New: Prometheus-style metrics & health check
+listen_addr: 10.99.0.1:53
+metrics_addr: 10.99.0.1:8080 # New: Prometheus-style metrics & health check
 request_timeout: 4s
 cache_size: 10000          # New: Max number of cached DNS responses
 
@@ -10,7 +9,7 @@ filter_ads: true
 
 whitelist:
   - yts.lt
-  - piratebay.org
+  - thepiratebay.org
 
 resolver_unfiltered:
   name: cloudflare-dns.com
@@ -29,5 +28,5 @@ resolver_anti_porn:
 
 resolver_anti_ads:
   name: dns.adguard-dns.com
-  addr: 94.140.15.15:853
+  addr: 94.140.14.14:443  # CHANGED: Port 853 -> 443 for DoH
   url: https://dns.adguard-dns.com/dns-query

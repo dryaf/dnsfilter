@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -49,8 +50,18 @@ func NewDNSFilter(configFile, listenAddr string) (*DNSFilter, error) {
 		return nil, fmt.Errorf("could not load config from file: %w", err)
 	}
 
+	// Override config if command line argument provided
 	if listenAddr != "" {
 		config.ListenAddr = listenAddr
+	}
+
+	// SMART FALLBACK:
+	// If the configured IP (e.g., 10.99.0.1) does not exist on this host,
+	// fallback to localhost (127.0.0.1) to ensure the service still starts
+	// and remains manageable.
+	config.ListenAddr = checkAndFallbackIP(config.ListenAddr, "udp")
+	if config.MetricsAddr != "" {
+		config.MetricsAddr = checkAndFallbackIP(config.MetricsAddr, "tcp")
 	}
 
 	if err = config.Validate(); err != nil {
@@ -70,11 +81,56 @@ func NewDNSFilter(configFile, listenAddr string) (*DNSFilter, error) {
 	}, nil
 }
 
+// checkAndFallbackIP attempts to bind to the address. If the IP is not available
+// (e.g. interface down or non-existent), it returns 127.0.0.1 with the original port.
+func checkAndFallbackIP(addr string, network string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr // Let later validation handle format errors
+	}
+
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return addr // Wildcards are always valid
+	}
+
+	// Try to bind. If it fails specifically because the address isn't available, fallback.
+	// We use ListenPacket for UDP and Listen for TCP.
+	var ln interface{ Close() error }
+
+	if network == "udp" {
+		ln, err = net.ListenPacket("udp", addr)
+	} else {
+		ln, err = net.Listen("tcp", addr)
+	}
+
+	if err == nil {
+		ln.Close()
+		return addr // Address is valid and available
+	}
+
+	// Check for "bind: cannot assign requested address" or similar OS errors
+	// This usually happens when the IP belongs to an interface that doesn't exist.
+	if strings.Contains(err.Error(), "assign requested address") || strings.Contains(err.Error(), "can't assign requested address") {
+		fallback := "127.0.0.1:" + port
+		slog.Warn("configured address not available on this host, falling back to localhost",
+			"configured", addr,
+			"fallback", fallback,
+			"error", err)
+		return fallback
+	}
+
+	// For other errors (e.g., "permission denied" or "address in use"),
+	// we return the original address and let the main Run() fail naturally
+	// so the user sees the real error.
+	return addr
+}
+
 func (p *DNSFilter) Run() error {
 	slog.Info("dns_filter starting",
 		"addr", p.Config.ListenAddr,
 		"metrics", p.Config.MetricsAddr,
-		"cache_size", p.Config.CacheSize)
+		"cache_size", p.Config.CacheSize,
+		"whitelist_count", len(p.Config.Whitelist))
 
 	readTimeout := p.Config.RequestTimeout
 	if readTimeout == 0 {
@@ -246,7 +302,7 @@ func (p *DNSFilter) ResolveDomain(ctx context.Context, domain string, originalMs
 	m.SetQuestion(dns.Fqdn(domain), dns.TypeA)
 	m.Id = originalMsgID
 
-	if whitelistedMsg, ok := p.checkWhitelist(ctx, domain, m, logger); ok {
+	if whitelistedMsg, ok := p.checkWhitelist(ctx, dns.Fqdn(domain), m, logger); ok {
 		return whitelistedMsg, nil
 	}
 
@@ -261,12 +317,14 @@ func (p *DNSFilter) ResolveDomain(ctx context.Context, domain string, originalMs
 func (p *DNSFilter) checkWhitelist(ctx context.Context, domain string, m *dns.Msg, logger *slog.Logger) (*dns.Msg, bool) {
 	for _, whitelistedDomain := range p.Config.Whitelist {
 		if domain == whitelistedDomain {
-			logger.Info("domain is whitelisted")
 			unfilteredResolver, exists := p.Config.Resolvers["resolver_unfiltered"]
 			if !exists {
 				logger.Error("resolver_unfiltered not found for whitelisted domain")
 				return nil, false
 			}
+
+			logger.Info("domain is whitelisted", "resolver", unfilteredResolver.Name)
+
 			resp, _, err := unfilteredResolver.resolve(ctx, m, logger)
 			if err != nil {
 				logger.Error("failed to resolve whitelisted domain", "error", err)
@@ -398,6 +456,10 @@ func (c *Config) Validate() error {
 		if err := resolver.LoadAndValidate(false); err != nil {
 			return fmt.Errorf("resolver %s failed validation: %w", name, err)
 		}
+	}
+	// Normalize Whitelist to FQDNs
+	for i, domain := range c.Whitelist {
+		c.Whitelist[i] = dns.Fqdn(domain)
 	}
 	return nil
 }
