@@ -1,5 +1,6 @@
-listen_addr: 0.0.0.0:53
-metrics_addr: 0.0.0.0:8080 # New: Prometheus-style metrics & health check
+#listen_addr: 10.99.0.1:53 # github.com/dryaf/wireguard
+listen_addr: 127.0.0.1:53
+metrics_addr: 127.0.0.1:8080 # New: Prometheus-style metrics & health check
 request_timeout: 4s
 cache_size: 10000          # New: Max number of cached DNS responses
 
@@ -8,7 +9,7 @@ filter_porn: true
 filter_ads: true
 
 whitelist:
-  - yts.mx
+  - yts.lt
   - piratebay.org
 
 resolver_unfiltered:
