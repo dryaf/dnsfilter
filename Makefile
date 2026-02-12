@@ -11,17 +11,17 @@ SSH_HOSTNAME := $(shell echo $(SSH_HOST) | cut -d@ -f2)
 # Default to "no" for WireGuard requirement. Use 'make deploy WG=yes' to enable.
 WG ?= no
 
-.PHONY: deps help lint format test build logs deploy
+.PHONY: deps help lint format test build logs deploy deploy-config
 
 help:
 	@echo "Available commands:"
-	@echo "  deps    - Install development dependencies"
-	@echo "  lint    - Run linters"
-	@echo "  test    - Run tests"
-	@echo "  build   - Build binary locally (for verification)"
-	@echo "  deploy  - Deploy to server via Ansible (uses .env)"
-	@echo "            Usage: make deploy [WG=yes]"
-	@echo "  logs    - Stream remote service logs"
+	@echo "  deps          - Install development dependencies"
+	@echo "  lint          - Run linters"
+	@echo "  test          - Run tests"
+	@echo "  build         - Build binary locally (for verification)"
+	@echo "  deploy        - Full deploy (binary + config)"
+	@echo "  deploy-config - Fast deploy (config only + reload)"
+	@echo "  logs          - Stream remote service logs"
 
 deps:
 	go install github.com/evilmartians/lefthook@latest
@@ -47,7 +47,7 @@ logs:
 	@echo "Streaming service logs from $(SSH_HOST)..."
 	ssh -p $(SSH_PORT) $(SSH_HOST) "journalctl -f -u dns-filter"
 
-# Deploy using Ansible
+# Deploy everything
 deploy:
 	@echo "Deploying to $(SSH_HOSTNAME) with user $(SSH_USER)..."
 	ansible-playbook build_and_deploy.yml \
@@ -55,3 +55,13 @@ deploy:
 		-u "$(SSH_USER)" \
 		-e "ansible_port=$(SSH_PORT)" \
 		-e "wg_required=$(WG)"
+
+# Deploy config only (Fast)
+deploy-config:
+	@echo "Updating configuration on $(SSH_HOSTNAME)..."
+	ansible-playbook build_and_deploy.yml \
+		-i "$(SSH_HOSTNAME)," \
+		-u "$(SSH_USER)" \
+		-e "ansible_port=$(SSH_PORT)" \
+		-e "wg_required=$(WG)" \
+		--tags "config,dns"

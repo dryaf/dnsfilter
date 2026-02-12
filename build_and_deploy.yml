@@ -30,6 +30,7 @@
         content: "nameserver 1.1.1.1\n"
         dest: /etc/resolv.conf
         mode: '0644'
+      tags: [bootstrap]
 
     # --- Dependency Checks ---
     - name: Ensure required system packages are installed
@@ -39,26 +40,26 @@
           - ufw
           - libcap2-bin # Required for setcap
         state: present
-        update_cache: yes # Ensure apt cache is fresh
+        update_cache: yes
+      tags: [bootstrap]
 
     # --- Feature Detection ---
     - name: Detect WireGuard interface
       set_fact:
         wg_enabled: "{{ 'wg0' in ansible_facts['interfaces'] }}"
       when: wg_required == "auto"
+      tags: [always]
 
     - name: Force WireGuard setting
       set_fact:
         wg_enabled: "{{ wg_required | bool }}"
       when: wg_required != "auto"
-
-    - name: Display WireGuard status
-      debug:
-        msg: "WireGuard support enabled: {{ wg_enabled }}"
+      tags: [always]
 
     - name: Set install command
       set_fact:
         install_cmd: "{{ target_bin }} -service install {{ '-wg' if wg_enabled else '' }}"
+      tags: [always]
 
     # --- Build Phase (Local) ---
     - name: Build the Linux binary
@@ -70,6 +71,7 @@
         GOOS: linux
         CGO_ENABLED: 0
         GOARCH: amd64
+      tags: [binary]
 
     # --- Preparation Phase (Remote) ---
     - name: Stop systemd-resolved service
@@ -79,6 +81,7 @@
         state: stopped
         enabled: no
       ignore_errors: yes
+      tags: [system]
 
     # --- Upload Phase (Atomic) ---
     - name: Upload the new binary to tmp location
@@ -89,12 +92,14 @@
         mode: "0755"
         owner: root
         group: root
+      tags: [binary]
 
     # --- Graceful Stop ---
     - name: Check if service exists
       stat:
         path: "{{ target_service_file }}"
       register: service_file
+      tags: [binary]
 
     - name: Stop old service
       become: yes
@@ -102,11 +107,14 @@
         name: "{{ service_name }}"
         state: stopped
       when: service_file.stat.exists
+      tags: [binary]
 
     - name: Atomic move of new binary
       become: yes
       command:
         cmd: "mv {{ target_bin_tmp }} {{ target_bin }}"
+      notify: Restart service
+      tags: [binary]
 
     - name: Upload the new configuration
       become: yes
@@ -114,6 +122,8 @@
         src: config.yml
         dest: "{{ target_config }}"
         mode: "0644"
+      notify: Restart service
+      tags: [config]
 
     # --- Setup Phase ---
     - name: Create {{ service_group }} group
@@ -121,6 +131,7 @@
       group:
         name: "{{ service_group }}"
         state: present
+      tags: [setup]
 
     - name: Create {{ service_user }} user
       become: yes
@@ -130,6 +141,7 @@
         system: yes
         shell: /bin/false
         create_home: no
+      tags: [setup]
 
     - name: Set ownership of config
       become: yes
@@ -137,11 +149,13 @@
         path: "{{ target_config }}"
         owner: "{{ service_user }}"
         group: "{{ service_group }}"
+      tags: [setup]
 
     - name: Set capabilities on binary
       become: yes
       command:
         cmd: "setcap 'cap_net_bind_service=+ep' {{ target_bin }}"
+      tags: [binary]
 
     - name: Configure UFW for WireGuard
       become: yes
@@ -152,6 +166,7 @@
         port: "53"
         proto: udp
       when: wg_enabled
+      tags: [firewall]
 
     - name: Configure resolv.conf
       become: yes
@@ -159,6 +174,7 @@
         content: "{{ 'nameserver 127.0.0.1\n' if use_local_dns == 'yes' else 'nameserver 1.1.1.2\n' }}"
         dest: /etc/resolv.conf
         mode: '0644'
+      tags: [dns]
 
     # --- Install & Start Phase ---
     - name: Install service (if not installed)
@@ -168,14 +184,16 @@
       register: install_result
       changed_when: "'already installed' not in install_result.stderr"
       failed_when: false
+      tags: [binary]
 
-    - name: Start and enable new service
+    - name: Ensure service is enabled and running
       become: yes
       systemd:
         name: "{{ service_name }}"
         state: started
         enabled: yes
         daemon_reload: yes
+      tags: [always]
 
     # --- Cleanup Phase (Local) ---
     - name: Remove local binary
@@ -183,3 +201,12 @@
       file:
         path: "{{ local_binary_path }}"
         state: absent
+      tags: [binary]
+
+  handlers:
+    - name: Restart service
+      become: yes
+      systemd:
+        name: "{{ service_name }}"
+        state: restarted
+        daemon_reload: yes
