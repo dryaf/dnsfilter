@@ -1,10 +1,13 @@
-listen_addr: 10.99.0.1:53
+listen_addr: 0.0.0.0:53
+metrics_addr: 0.0.0.0:8080 # New: Prometheus-style metrics & health check
+request_timeout: 4s
+cache_size: 10000          # New: Max number of cached DNS responses
 
 filter_malware: true
 filter_porn: true
 filter_ads: true
 
-whitelist: 
+whitelist:
   - yts.mx
   - piratebay.org
 

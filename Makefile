@@ -4,56 +4,54 @@ ifneq (,$(wildcard ./.env))
     export
 endif
 
-# Configurable parameters
-TARGET_BIN := /usr/local/bin/dns_filter
-TARGET_CONFIG := /etc/dnsfilter.yml
+# Extract User and Host from SSH_HOST (format: user@host) for Ansible
+SSH_USER := $(shell echo $(SSH_HOST) | cut -d@ -f1)
+SSH_HOSTNAME := $(shell echo $(SSH_HOST) | cut -d@ -f2)
+
+# Default to "no" for WireGuard requirement. Use 'make deploy WG=yes' to enable.
+WG ?= no
+
+.PHONY: deps help lint format test build logs deploy
+
+help:
+	@echo "Available commands:"
+	@echo "  deps    - Install development dependencies"
+	@echo "  lint    - Run linters"
+	@echo "  test    - Run tests"
+	@echo "  build   - Build binary locally (for verification)"
+	@echo "  deploy  - Deploy to server via Ansible (uses .env)"
+	@echo "            Usage: make deploy [WG=yes]"
+	@echo "  logs    - Stream remote service logs"
 
 deps:
 	go install github.com/evilmartians/lefthook@latest
 	go install golang.org/x/vuln/cmd/govulncheck@latest
+	go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
 
-help:
-	echo "what?"
+lint:
+	golangci-lint run ./...
 
-# Build the Linux binary
+format:
+	go fmt ./...
+
+test:
+	go test -race -covermode=atomic -coverprofile=coverage.out ./...
+	go tool cover -func=coverage.out
+
+# Build the Linux binary (Local Verification)
 build:
 	cd service && GOOS=linux CGO_ENABLED=0 GOARCH=amd64 go build -a -installsuffix cgo -o dns_filter_linux
 
 # Stream the service logs
 logs:
-	@echo "Streaming service logs..."
+	@echo "Streaming service logs from $(SSH_HOST)..."
 	ssh -p $(SSH_PORT) $(SSH_HOST) "journalctl -f -u dns-filter"
 
-# Remove the old binary
-clean:
-	@echo "Removing old binary..."
-	ssh -p $(SSH_PORT) $(SSH_HOST) "service dns-filter stop || true && \
-	$(TARGET_BIN) -service uninstall || true && \
-	rm -f $(TARGET_BIN)"
-
-# Upload the new binary and configuration
-upload: build
-	@echo "Uploading binary and configuration..."
-	scp  -P $(SSH_PORT) service/dns_filter_linux $(SSH_HOST):$(TARGET_BIN)
-	scp  -P $(SSH_PORT) config.yml $(SSH_HOST):$(TARGET_CONFIG)
-
-# Setup the service on the server
-setup: upload
-	@echo "Setting up service..."
-	ssh -p $(SSH_PORT) $(SSH_HOST) "[ -f $(TARGET_BIN) ] && \
-	groupadd dnsfilter || true && \
-	useradd -G dnsfilter -r -M -N -s /bin/false dnsfilter || true && \
-	chown -R dnsfilter:dnsfilter $(TARGET_BIN) $(TARGET_CONFIG) && \
-	ufw allow in on wg0 to any port 53 proto udp && \
-	chmod 755 $(TARGET_BIN) $(TARGET_CONFIG) && \
-	setcap cap_net_bind_service=+ep $(TARGET_BIN) && \
-	systemctl stop systemd-resolved || true && \
-	systemctl disable systemd-resolved || true && \
-	rm -f /etc/resolv.conf && echo \"nameserver 1.1.1.2\" | tee /etc/resolv.conf && \
-	$(TARGET_BIN) -service install && \
-	service dns-filter start"
-
-# Full deployment process
-deploy: clean build upload setup
-	@echo "Removal of old binary, upload and setup finished."
-	rm -f service/dns_filter_linux
+# Deploy using Ansible
+deploy:
+	@echo "Deploying to $(SSH_HOSTNAME) with user $(SSH_USER)..."
+	ansible-playbook build_and_deploy.yml \
+		-i "$(SSH_HOSTNAME)," \
+		-u "$(SSH_USER)" \
+		-e "ansible_port=$(SSH_PORT)" \
+		-e "wg_required=$(WG)"
