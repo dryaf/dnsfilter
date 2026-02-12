@@ -5,7 +5,8 @@ filter_porn: true
 filter_ads: true
 
 whitelist: 
-  - yts.mx
+  - yts.bz
+  - yts.lt
   - piratebay.org
 
 resolver_unfiltered:

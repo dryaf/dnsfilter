@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"golang.org/x/exp/slog"
 )
 
 // --- Mock DNS Client ---
@@ -117,6 +118,8 @@ resolver_anti_ads:
 		},
 	}
 
+	logger := slog.Default()
+
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Create a filter instance for each test
@@ -126,7 +129,7 @@ resolver_anti_ads:
 				"resolver_anti_ads":     mockAds,
 			})
 
-			msg, err := filter.ResolveDomain(context.Background(), tc.domain, 1)
+			msg, err := filter.ResolveDomain(context.Background(), tc.domain, 1, logger)
 			if err != nil && msg == nil {
 				t.Fatalf("ResolveDomain returned a nil message with error: %v", err)
 			}

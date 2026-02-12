@@ -1,8 +1,8 @@
 ---
-- hosts: servers
+- hosts: all
+  gather_facts: no # Speed up connection if python is missing or just raw deployment
   vars:
     # --- Project Variables ---
-    # Define all names and paths in one place for easy maintenance.
     service_name: "dns-filter"
     service_user: "dnsfilter"
     service_group: "dnsfilter"
@@ -10,35 +10,21 @@
 
     # --- Target Paths ---
     target_bin: "/usr/local/bin/{{ binary_name }}"
-    target_config: "/etc/{{ service_user }}.yml"
+    target_config: "/etc/dnsfilter.yml" # Renamed to standard location
 
     # --- Local Paths ---
     local_binary_path: "service/{{ binary_name }}_linux"
 
-  vars_prompt:
-    - name: "wg_required"
-      prompt: "Is WireGuard requirement needed? (yes/no)"
-      private: no
-      default: "no"
+    # --- Feature Flags ---
+    # Can be overridden via --extra-vars "wg_required=yes"
+    wg_required: "no"
 
   tasks:
     - name: Set install command
       set_fact:
         install_cmd: "{{ target_bin }} -service install {{ '-wg' if wg_required == 'yes' else '' }}"
 
-    - name: Stop systemd-resolved service
-      become: yes
-      systemd:
-        name: systemd-resolved
-        state: stopped
-      when: wg_required == 'no'
-
-    - name: Disable systemd-resolved service
-      become: yes
-      systemd:
-        name: systemd-resolved
-        enabled: no
-
+    # --- Build Phase (Local) ---
     - name: Build the Linux binary
       delegate_to: localhost
       command:
@@ -48,6 +34,15 @@
         GOOS: linux
         CGO_ENABLED: 0
         GOARCH: amd64
+
+    # --- Preparation Phase (Remote) ---
+    - name: Stop systemd-resolved service
+      become: yes
+      systemd:
+        name: systemd-resolved
+        state: stopped
+        enabled: no
+      ignore_errors: yes
 
     - name: Stop old service
       become: yes
@@ -61,6 +56,7 @@
       command:
         cmd: "{{ target_bin }} -service uninstall"
       ignore_errors: yes
+      failed_when: false # Don't fail if binary doesn't exist
 
     - name: Remove the old binary
       become: yes
@@ -68,12 +64,15 @@
         path: "{{ target_bin }}"
         state: absent
 
+    # --- Upload Phase ---
     - name: Upload the new binary
       become: yes
       copy:
         src: "{{ local_binary_path }}"
         dest: "{{ target_bin }}"
         mode: "0755"
+        owner: root
+        group: root
 
     - name: Upload the new configuration
       become: yes
@@ -82,6 +81,7 @@
         dest: "{{ target_config }}"
         mode: "0644"
 
+    # --- Setup Phase ---
     - name: Create {{ service_group }} group
       become: yes
       group:
@@ -95,27 +95,23 @@
         group: "{{ service_group }}"
         system: yes
         shell: /bin/false
+        create_home: no
 
-    - name: Set permissions on binary and config
+    - name: Set ownership of config
       become: yes
       file:
-        path: "{{ item }}"
+        path: "{{ target_config }}"
         owner: "{{ service_user }}"
         group: "{{ service_group }}"
-        mode: "0755"
-      loop:
-        - "{{ target_bin }}"
-        - "{{ target_config }}"
 
     - name: Set capabilities on binary
       become: yes
-      ansible.builtin.command:
+      command:
         cmd: "setcap 'cap_net_bind_service=+ep' {{ target_bin }}"
-      changed_when: false # This command is idempotent but ansible doesn't know that.
 
-    - name: Open port 53 on wg0 for DNS
+    - name: Configure UFW for WireGuard
       become: yes
-      ansible.builtin.ufw:
+      ufw:
         rule: allow
         direction: in
         interface: wg0
@@ -123,6 +119,14 @@
         proto: udp
       when: wg_required == 'yes'
 
+    - name: Configure resolv.conf
+      become: yes
+      copy:
+        content: "nameserver 1.1.1.2\n"
+        dest: /etc/resolv.conf
+        mode: '0644'
+
+    # --- Install & Start Phase ---
     - name: Install new service
       become: yes
       command:
@@ -135,12 +139,8 @@
         state: started
         enabled: yes
         daemon_reload: yes
-      register: service_status
 
-    - name: Display service status
-      debug:
-        var: service_status
-
+    # --- Cleanup Phase (Local) ---
     - name: Remove local binary
       delegate_to: localhost
       file:

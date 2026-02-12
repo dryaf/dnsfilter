@@ -49,7 +49,7 @@ type DNSFilter struct {
 
 func NewDNSFilter(configFile, listenAddr string) (*DNSFilter, error) {
 	if configFile == "" {
-		panic("no config.yml")
+		return nil, errors.New("config file path is required")
 	}
 
 	config, err := ConfigFromFile(configFile)
@@ -69,13 +69,24 @@ func NewDNSFilter(configFile, listenAddr string) (*DNSFilter, error) {
 }
 
 func (p *DNSFilter) Run() error {
-	slog.Info("dns_filter",
+	slog.Info("dns_filter starting",
 		"addr", p.Config.ListenAddr,
 		"filter_ads", p.Config.FilterAds,
 		"filter_malware", p.Config.FilterMalware,
 		"filter_porn", p.Config.FilterPorn)
 
-	server := &dns.Server{Addr: p.Config.ListenAddr, Net: "udp"}
+	// Set default timeouts if not configured
+	readTimeout := p.Config.RequestTimeout
+	if readTimeout == 0 {
+		readTimeout = 5 * time.Second
+	}
+
+	server := &dns.Server{
+		Addr:         p.Config.ListenAddr,
+		Net:          "udp",
+		ReadTimeout:  readTimeout,
+		WriteTimeout: readTimeout,
+	}
 	dns.HandleFunc(".", p.Resolve)
 
 	// Create a channel to receive OS signals
@@ -85,14 +96,16 @@ func (p *DNSFilter) Run() error {
 	// Run our server in a goroutine so that it doesn't block.
 	go func() {
 		if err := server.ListenAndServe(); err != nil {
-			slog.Error(fmt.Sprintf("failed to serve: %s", err.Error()))
+			slog.Error("failed to serve", "error", err)
 		}
 	}()
 
 	<-stop // Wait for SIGINT
 
-	// Call server's Shutdown method with the context
-	if err := server.Shutdown(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.ShutdownContext(ctx); err != nil {
 		return fmt.Errorf("server shutdown failed: %w", err)
 	}
 
@@ -101,132 +114,184 @@ func (p *DNSFilter) Run() error {
 }
 
 func (p *DNSFilter) Resolve(w dns.ResponseWriter, r *dns.Msg) {
-	ctx := context.Background() // you should use a real context from your application
-	resolvedMsg, err := p.ResolveDomain(ctx, r.Question[0].Name, r.Id)
-	if err != nil {
-		slog.Error("resolve_domain", err)
-		dnsErr := new(dns.Msg)
-		dnsErr.SetRcode(r, dns.RcodeServerFailure)
-		w.WriteMsg(dnsErr)
+	if len(r.Question) == 0 {
 		return
 	}
+
+	// 1. Setup Context with Timeout
+	timeout := p.Config.RequestTimeout
+	if timeout == 0 {
+		timeout = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// 2. Setup Structured Logger
+	clientIP, _, _ := net.SplitHostPort(w.RemoteAddr().String())
+	q := r.Question[0]
+	reqLogger := slog.With(
+		"id", r.Id,
+		"domain", q.Name,
+		"client_ip", clientIP,
+		"type", dns.TypeToString[q.Qtype],
+	)
+
+	// 3. Resolve
+	resolvedMsg, err := p.ResolveDomain(ctx, q.Name, r.Id, reqLogger)
+	if err != nil {
+		reqLogger.Error("resolve_domain failed", "error", err)
+		dnsErr := new(dns.Msg)
+		dnsErr.SetRcode(r, dns.RcodeServerFailure)
+		_ = w.WriteMsg(dnsErr)
+		return
+	}
+
+	// 4. Write Response
 	if err := w.WriteMsg(resolvedMsg); err != nil {
-		slog.Error("write_msg", err)
+		reqLogger.Error("write_msg failed", "error", err)
 	}
 }
 
-func (p *DNSFilter) ResolveDomain(ctx context.Context, domain string, originalMsgID uint16) (*dns.Msg, error) {
+// ResolveDomain handles the core logic: whitelist checking, resolver selection, and concurrent lookups.
+func (p *DNSFilter) ResolveDomain(ctx context.Context, domain string, originalMsgID uint16, logger *slog.Logger) (*dns.Msg, error) {
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(domain), dns.TypeA)
 	m.Id = originalMsgID
 
-	// Check if domain is whitelisted
-	for _, whitelistedDomain := range p.Config.Whitelist {
-		if domain == whitelistedDomain {
-			// Domain is whitelisted, resolve it without filtering
-			unfilteredResolver, exists := p.Config.Resolvers["resolver_unfiltered"]
-			if !exists {
-				return nil, fmt.Errorf("resolver_unfiltered not found")
-			}
-			m, _, err := unfilteredResolver.resolve(ctx, m, "")
-			if err != nil {
-				return nil, fmt.Errorf("failed to resolve '%s': %w", domain, err)
-			}
-			return m, nil
-		}
+	// 1. Check Whitelist
+	if whitelistedMsg, ok := p.checkWhitelist(ctx, domain, m, logger); ok {
+		return whitelistedMsg, nil
 	}
 
-	var firstResolver *Resolver
+	// 2. Select Primary Resolver
+	firstResolver, err := p.getPrimaryResolver()
+	if err != nil {
+		return nil, err
+	}
+
+	// 3. Execute Resolution (Primary + Ads concurrently)
+	return p.resolveConcurrently(ctx, m, firstResolver, logger)
+}
+
+func (p *DNSFilter) checkWhitelist(ctx context.Context, domain string, m *dns.Msg, logger *slog.Logger) (*dns.Msg, bool) {
+	for _, whitelistedDomain := range p.Config.Whitelist {
+		if domain == whitelistedDomain {
+			logger.Info("domain is whitelisted")
+			unfilteredResolver, exists := p.Config.Resolvers["resolver_unfiltered"]
+			if !exists {
+				logger.Error("resolver_unfiltered not found for whitelisted domain")
+				return nil, false
+			}
+			resp, _, err := unfilteredResolver.resolve(ctx, m, logger)
+			if err != nil {
+				logger.Error("failed to resolve whitelisted domain", "error", err)
+				return nil, false
+			}
+			return resp, true
+		}
+	}
+	return nil, false
+}
+
+func (p *DNSFilter) getPrimaryResolver() (*Resolver, error) {
+	var resolver *Resolver
 	var exists bool
 
 	switch {
 	case p.Config.FilterPorn:
-		firstResolver, exists = p.Config.Resolvers["resolver_anti_porn"]
+		resolver, exists = p.Config.Resolvers["resolver_anti_porn"]
 	case p.Config.FilterMalware:
-		firstResolver, exists = p.Config.Resolvers["resolver_anti_malware"]
+		resolver, exists = p.Config.Resolvers["resolver_anti_malware"]
 	default:
-		firstResolver, exists = p.Config.Resolvers["resolver_unfiltered"]
-	}
-	if !exists {
-		return nil, fmt.Errorf("configured resolver not found")
+		resolver, exists = p.Config.Resolvers["resolver_unfiltered"]
 	}
 
+	if !exists {
+		return nil, fmt.Errorf("configured primary resolver not found")
+	}
+	return resolver, nil
+}
+
+// resultStruct helps gather concurrent results
+type resolveResult struct {
+	msg         *dns.Msg
+	gotFiltered bool
+	err         error
+}
+
+func (p *DNSFilter) resolveConcurrently(ctx context.Context, m *dns.Msg, primary *Resolver, logger *slog.Logger) (*dns.Msg, error) {
 	g, gctx := errgroup.WithContext(ctx)
 
-	var m1 *dns.Msg
-	var m1_got_filtered bool
-	var err1 error
+	// Channel to capture results. Buffered to avoid blocking goroutines.
+	// Index 0: Primary, Index 1: Ads
+	results := make([]resolveResult, 2)
 
-	// Goroutine for the primary resolver (porn/malware/unfiltered)
+	// 1. Primary Resolver
 	g.Go(func() error {
-		m1, m1_got_filtered, err1 = firstResolver.resolve(gctx, m.Copy(), "")
-		return err1
+		msg, filtered, err := primary.resolve(gctx, m.Copy(), logger.With("resolver", primary.Name))
+		results[0] = resolveResult{msg: msg, gotFiltered: filtered, err: err}
+		return err // If primary fails, we might want to cancel everything
 	})
 
-	var m2 *dns.Msg
-	var m2_got_filtered bool
-	var err2 error
-
-	// Goroutine for the ads resolver, if enabled
+	// 2. Ads Resolver (Optional)
 	if p.Config.FilterAds {
 		g.Go(func() error {
-			antiAdsResolver, exists := p.Config.Resolvers["resolver_anti_ads"]
+			adsResolver, exists := p.Config.Resolvers["resolver_anti_ads"]
 			if !exists {
 				return fmt.Errorf("resolver_anti_ads not found")
 			}
-			m2, m2_got_filtered, err2 = antiAdsResolver.resolve(gctx, m.Copy(), "")
-			return err2
+			msg, filtered, err := adsResolver.resolve(gctx, m.Copy(), logger.With("resolver", adsResolver.Name))
+			results[1] = resolveResult{msg: msg, gotFiltered: filtered, err: err}
+			return err
 		})
 	}
 
+	// Wait for completion
 	_ = g.Wait()
+	// Note: We ignore the error from Wait() intentionally here to process partial results or specific logic below,
+	// checking results[i].err individually.
 
-	if m1_got_filtered {
-		return m1, nil
-	}
-	if m2_got_filtered {
-		return m2, nil
-	}
+	rPrimary := results[0]
+	rAds := results[1]
 
-	if p.Config.FilterAds && p.Config.Resolvers["resolver_anti_ads"] == nil {
-		return nil, fmt.Errorf("resolver_anti_ads not found")
-	}
-
-	var combinedErr error
-	if err1 != nil || err2 != nil {
-		combinedErr = fmt.Errorf("errors while resolving: %v, %v", err1, err2)
+	// Priority 1: Primary blocked content (Malware/Porn)
+	if rPrimary.gotFiltered {
+		return rPrimary.msg, nil
 	}
 
-	if m1 == nil && m2 == nil {
-		return nil, fmt.Errorf("failed to resolve '%s': domain not found", domain)
+	// Priority 2: Ads blocked content
+	if p.Config.FilterAds && rAds.gotFiltered {
+		return rAds.msg, nil
 	}
 
-	if m1 != nil {
-		return m1, combinedErr
+	// Priority 3: Return Primary valid response
+	if rPrimary.msg != nil {
+		return rPrimary.msg, rPrimary.err
 	}
 
-	return m2, combinedErr
+	// Fallback/Error handling
+	if rPrimary.err != nil {
+		return nil, rPrimary.err
+	}
+	if p.Config.FilterAds && rAds.err != nil {
+		return nil, rAds.err
+	}
+
+	return nil, fmt.Errorf("resolution failed with no response")
 }
 
-type ResolveError struct {
-	Resolver string
-	Err      error
-}
-
-func (re *ResolveError) Error() string {
-	return fmt.Sprintf("resolver '%s' error: %v", re.Resolver, re.Err)
-}
+// Config Definitions
 
 type Config struct {
-	ListenAddr string `yaml:"listen_addr"`
+	ListenAddr     string        `yaml:"listen_addr"`
+	RequestTimeout time.Duration `yaml:"request_timeout"`
 
 	FilterMalware bool `yaml:"filter_malware"`
 	FilterPorn    bool `yaml:"filter_porn"`
 	FilterAds     bool `yaml:"filter_ads"`
 
 	Resolvers map[string]*Resolver `yaml:",inline"`
-
-	Whitelist []string `yaml:"whitelist"`
+	Whitelist []string             `yaml:"whitelist"`
 }
 
 func ConfigFromFile(path string) (*Config, error) {
@@ -253,8 +318,10 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// Resolver Definitions
+
 type Resolver struct {
-	dnsClient     dnsExchanger `yaml:"-"` // Use the interface
+	dnsClient     dnsExchanger `yaml:"-"`
 	httpsClient   *http.Client `yaml:"-"`
 	Name          string       `yaml:"name"`
 	Addr          string       `yaml:"addr"`
@@ -272,45 +339,38 @@ func (resolver *Resolver) LoadAndValidate(isTest bool) error {
 		if err != nil {
 			return fmt.Errorf("invalid URL: %w", err)
 		}
-
-		resolver.httpsClient = &http.Client{
-			Timeout: time.Second * 5,
-		}
+		resolver.httpsClient = &http.Client{Timeout: 5 * time.Second}
 	} else {
-		// In tests, dnsClient will be replaced by a mock.
+		// Initialize DNS client if not already mocked
 		if resolver.dnsClient == nil {
 			client := &dns.Client{
-				Net:     "tcp-tls",
-				Timeout: time.Second * 5,
-				TLSConfig: &tls.Config{
-					ServerName: resolver.TLSServerName,
-				},
+				Net:       "tcp-tls",
+				Timeout:   5 * time.Second,
+				TLSConfig: &tls.Config{ServerName: resolver.TLSServerName},
 			}
-			resolver.dnsClient = &realDNSClient{client: client} // Wrap the real client
+			resolver.dnsClient = &realDNSClient{client: client}
 		}
 	}
-
 	return nil
 }
 
-func (resolver *Resolver) resolve(ctx context.Context, m *dns.Msg, requestingIP string) (*dns.Msg, bool, error) {
+func (resolver *Resolver) resolve(ctx context.Context, m *dns.Msg, logger *slog.Logger) (*dns.Msg, bool, error) {
 	var err error
 	var resp *dns.Msg
 
 	if resolver.URL != "" {
 		m.SetEdns0(dns.DefaultMsgSize*2, false)
-		resp, err = resolver.makeHttpsRequest(ctx, m)
+		resp, err = resolver.makeHttpsRequest(ctx, m, logger)
 		if err != nil {
-			slog.Error(resolver.Name+"_dns_exchange", err, "resolver", resolver.Addr)
-			return nil, false, fmt.Errorf("failed to exchange dns context: %w", err)
+			logger.Error("doh_exchange failed", "error", err)
+			return nil, false, fmt.Errorf("doh exchange failed: %w", err)
 		}
 	} else {
 		m.SetEdns0(dns.DefaultMsgSize*2, false)
 		resp, _, err = resolver.dnsClient.ExchangeContext(ctx, m, resolver.Addr)
 		if err != nil {
-			// Context errors are handled by errgroup, so we just check for other errors
-			slog.Error(resolver.Name+"_dns_exchange", err, "resolver", resolver.Addr)
-			return nil, false, fmt.Errorf("failed to exchange dns context: %w", err)
+			logger.Error("dns_exchange failed", "error", err)
+			return nil, false, fmt.Errorf("dns exchange failed: %w", err)
 		}
 	}
 
@@ -318,20 +378,16 @@ func (resolver *Resolver) resolve(ctx context.Context, m *dns.Msg, requestingIP 
 		return nil, false, errors.New("resolver returned nil response")
 	}
 
-	clientValue, ok := ctx.Value("client").(string)
-	if !ok {
-		clientValue = "unknown"
-	}
-
+	// Logic to determine if response is a block
 	if resp.Rcode == dns.RcodeNameError {
-		slog.Info("blocked", "domain", m.Question[0].Name, "resolver", resolver.Addr, "client", clientValue, "reason", "NXDOMAIN")
+		logger.Info("blocked", "reason", "NXDOMAIN")
 		return resp, true, nil
 	}
 
 	for _, rr := range resp.Answer {
 		if a, ok := rr.(*dns.A); ok {
 			if a.A.String() == "0.0.0.0" {
-				slog.Info("blocked", "domain", a.Hdr.Name, "resolver", resolver.Addr, "client", clientValue)
+				logger.Info("blocked", "reason", "0.0.0.0")
 				return resp, true, nil
 			}
 		}
@@ -339,39 +395,36 @@ func (resolver *Resolver) resolve(ctx context.Context, m *dns.Msg, requestingIP 
 	return resp, false, nil
 }
 
-func (rs *Resolver) makeHttpsRequest(ctx context.Context, reqMsg *dns.Msg) (respMsg *dns.Msg, err error) {
-	// ... (implementation is unchanged)
+func (rs *Resolver) makeHttpsRequest(ctx context.Context, reqMsg *dns.Msg, logger *slog.Logger) (*dns.Msg, error) {
 	wire, err := reqMsg.Pack()
 	if err != nil {
-		slog.Error("dns msg pack", err, "msg", reqMsg)
-		return nil, err
-	}
-	buff := bytes.NewBuffer(wire)
-	resp, err := rs.httpsClient.Post(rs.URL, "application/dns-udpwireformat", buff)
-	if resp != nil {
-		defer resp.Body.Close()
-	}
-	if err != nil {
-		slog.Error("https post", err, "response")
-		return nil, err
+		return nil, fmt.Errorf("pack failed: %w", err)
 	}
 
+	req, err := http.NewRequestWithContext(ctx, "POST", rs.URL, bytes.NewBuffer(wire))
+	if err != nil {
+		return nil, fmt.Errorf("http request creation failed: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/dns-udpwireformat")
+
+	resp, err := rs.httpsClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("http post failed: %w", err)
+	}
+	defer resp.Body.Close()
+
 	if resp.StatusCode != 200 {
-		slog.Error("dns_https", err, "response", resp)
-		return nil, errors.New("http status not 200")
+		return nil, fmt.Errorf("http status %d", resp.StatusCode)
 	}
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		slog.Error("ioutil", err, "body", respBody)
-		return nil, err
+		return nil, fmt.Errorf("read body failed: %w", err)
 	}
 
-	respMsg = new(dns.Msg)
-	err = respMsg.Unpack(respBody)
-	if err != nil {
-		slog.Error("respMsg.Unpack", err, "question", reqMsg.Question)
-		return nil, err
+	respMsg := new(dns.Msg)
+	if err := respMsg.Unpack(respBody); err != nil {
+		return nil, fmt.Errorf("unpack failed: %w", err)
 	}
 	respMsg.SetEdns0(dns.DefaultMsgSize*4, false)
 	respMsg.SetReply(reqMsg)
@@ -390,11 +443,9 @@ func validateAddrWithPort(addr string, isTest bool) error {
 	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
 		return fmt.Errorf("invalid port: %w", err)
 	}
-
 	if isTest {
-		return nil // Looser validation for tests
+		return nil
 	}
-
 	if ip := net.ParseIP(host); ip == nil {
 		return fmt.Errorf("host '%s' is not a valid IP address", host)
 	}
