@@ -1,6 +1,6 @@
 ---
 - hosts: all
-  gather_facts: no # Speed up connection if python is missing or just raw deployment
+  gather_facts: no
   vars:
     # --- Project Variables ---
     service_name: "dns-filter"
@@ -10,14 +10,17 @@
 
     # --- Target Paths ---
     target_bin: "/usr/local/bin/{{ binary_name }}"
-    target_config: "/etc/dnsfilter.yml" # Renamed to standard location
+    target_bin_tmp: "/usr/local/bin/{{ binary_name }}.new"
+    target_config: "/etc/dnsfilter.yml"
 
     # --- Local Paths ---
     local_binary_path: "service/{{ binary_name }}_linux"
 
     # --- Feature Flags ---
-    # Can be overridden via --extra-vars "wg_required=yes"
     wg_required: "no"
+    # Set this to "yes" if you want the server to use ITSELF for DNS.
+    # WARNING: Requires the Go code to strictly use `transport.DialContext` to avoid loops.
+    use_local_dns: "yes"
 
   tasks:
     - name: Set install command
@@ -44,6 +47,16 @@
         enabled: no
       ignore_errors: yes
 
+    # --- Upload Phase (Atomic) ---
+    - name: Upload the new binary to tmp location
+      become: yes
+      copy:
+        src: "{{ local_binary_path }}"
+        dest: "{{ target_bin_tmp }}"
+        mode: "0755"
+        owner: root
+        group: root
+
     - name: Stop old service
       become: yes
       systemd:
@@ -51,28 +64,10 @@
         state: stopped
       ignore_errors: yes
 
-    - name: Uninstall old service
+    - name: Atomic move of new binary
       become: yes
       command:
-        cmd: "{{ target_bin }} -service uninstall"
-      ignore_errors: yes
-      failed_when: false # Don't fail if binary doesn't exist
-
-    - name: Remove the old binary
-      become: yes
-      file:
-        path: "{{ target_bin }}"
-        state: absent
-
-    # --- Upload Phase ---
-    - name: Upload the new binary
-      become: yes
-      copy:
-        src: "{{ local_binary_path }}"
-        dest: "{{ target_bin }}"
-        mode: "0755"
-        owner: root
-        group: root
+        cmd: "mv {{ target_bin_tmp }} {{ target_bin }}"
 
     - name: Upload the new configuration
       become: yes
@@ -122,15 +117,18 @@
     - name: Configure resolv.conf
       become: yes
       copy:
-        content: "nameserver 1.1.1.2\n"
+        content: "{{ 'nameserver 127.0.0.1\n' if use_local_dns == 'yes' else 'nameserver 1.1.1.2\n' }}"
         dest: /etc/resolv.conf
         mode: '0644'
 
     # --- Install & Start Phase ---
-    - name: Install new service
+    - name: Install service (if not installed)
       become: yes
       command:
         cmd: "{{ install_cmd }}"
+      register: install_result
+      changed_when: "'already installed' not in install_result.stderr"
+      failed_when: false # Ignore if already installed
 
     - name: Start and enable new service
       become: yes

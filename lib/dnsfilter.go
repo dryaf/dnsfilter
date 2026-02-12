@@ -1,18 +1,15 @@
 package lib
 
 import (
-	"bytes"
 	"context"
-	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
-	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -29,22 +26,17 @@ type Proxy interface {
 // Ensure DNSFilter implements the Proxy interface.
 var _ Proxy = (*DNSFilter)(nil)
 
-// dnsExchanger defines an interface for a DNS client, allowing for mocking in tests.
-type dnsExchanger interface {
-	ExchangeContext(ctx context.Context, m *dns.Msg, a string) (r *dns.Msg, rtt time.Duration, err error)
-}
-
-// realDNSClient wraps a real *dns.Client to satisfy the dnsExchanger interface.
-type realDNSClient struct {
-	client *dns.Client
-}
-
-func (c *realDNSClient) ExchangeContext(ctx context.Context, m *dns.Msg, a string) (r *dns.Msg, rtt time.Duration, err error) {
-	return c.client.ExchangeContext(ctx, m, a)
-}
-
 type DNSFilter struct {
 	Config *Config
+	Cache  *DNSCache
+	stats  *Stats
+}
+
+type Stats struct {
+	RequestsTotal uint64 `json:"requests_total"`
+	BlockedTotal  uint64 `json:"blocked_total"`
+	ErrorsTotal   uint64 `json:"errors_total"`
+	CacheHits     uint64 `json:"cache_hits"`
 }
 
 func NewDNSFilter(configFile, listenAddr string) (*DNSFilter, error) {
@@ -65,60 +57,134 @@ func NewDNSFilter(configFile, listenAddr string) (*DNSFilter, error) {
 		return nil, fmt.Errorf("could not validate config: %w", err)
 	}
 
-	return &DNSFilter{Config: config}, nil
+	cacheSize := config.CacheSize
+	if cacheSize == 0 {
+		cacheSize = 10000
+	}
+
+	return &DNSFilter{
+		Config: config,
+		// Defaulting minimum cache TTL to 10 seconds for production safety
+		Cache: NewDNSCache(cacheSize, 10),
+		stats: &Stats{},
+	}, nil
 }
 
 func (p *DNSFilter) Run() error {
 	slog.Info("dns_filter starting",
 		"addr", p.Config.ListenAddr,
-		"filter_ads", p.Config.FilterAds,
-		"filter_malware", p.Config.FilterMalware,
-		"filter_porn", p.Config.FilterPorn)
+		"metrics", p.Config.MetricsAddr,
+		"cache_size", p.Config.CacheSize)
 
-	// Set default timeouts if not configured
 	readTimeout := p.Config.RequestTimeout
 	if readTimeout == 0 {
 		readTimeout = 5 * time.Second
 	}
 
-	server := &dns.Server{
+	// Servers setup
+	udpServer := &dns.Server{
 		Addr:         p.Config.ListenAddr,
 		Net:          "udp",
 		ReadTimeout:  readTimeout,
 		WriteTimeout: readTimeout,
+		Handler:      dns.HandlerFunc(p.Resolve),
 	}
-	dns.HandleFunc(".", p.Resolve)
 
-	// Create a channel to receive OS signals
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt)
+	tcpServer := &dns.Server{
+		Addr:         p.Config.ListenAddr,
+		Net:          "tcp",
+		ReadTimeout:  readTimeout,
+		WriteTimeout: readTimeout,
+		Handler:      dns.HandlerFunc(p.Resolve),
+	}
 
-	// Run our server in a goroutine so that it doesn't block.
-	go func() {
-		if err := server.ListenAndServe(); err != nil {
-			slog.Error("failed to serve", "error", err)
+	g, ctx := errgroup.WithContext(context.Background())
+
+	// 1. UDP Listener
+	g.Go(func() error {
+		slog.Info("listening on udp", "addr", p.Config.ListenAddr)
+		if err := udpServer.ListenAndServe(); err != nil {
+			return fmt.Errorf("udp server failed: %w", err)
 		}
-	}()
+		return nil
+	})
 
-	<-stop // Wait for SIGINT
+	// 2. TCP Listener
+	g.Go(func() error {
+		slog.Info("listening on tcp", "addr", p.Config.ListenAddr)
+		if err := tcpServer.ListenAndServe(); err != nil {
+			return fmt.Errorf("tcp server failed: %w", err)
+		}
+		return nil
+	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	// 3. Metrics & Health Server
+	if p.Config.MetricsAddr != "" {
+		g.Go(func() error {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("OK"))
+			})
+			mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(p.stats)
+			})
 
-	if err := server.ShutdownContext(ctx); err != nil {
-		return fmt.Errorf("server shutdown failed: %w", err)
+			server := &http.Server{
+				Addr:    p.Config.MetricsAddr,
+				Handler: mux,
+			}
+			slog.Info("listening metrics", "addr", p.Config.MetricsAddr)
+			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				return fmt.Errorf("metrics server failed: %w", err)
+			}
+			return nil
+		})
 	}
 
-	slog.Info("gracefully stopped server")
-	return nil
+	// 4. Signal Monitor
+	g.Go(func() error {
+		stop := make(chan os.Signal, 1)
+		signal.Notify(stop, os.Interrupt)
+
+		select {
+		case <-stop:
+			slog.Info("signal received, shutting down")
+		case <-ctx.Done():
+			// Another goroutine failed, strictly shutdown
+		}
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := udpServer.ShutdownContext(shutdownCtx); err != nil {
+			slog.Error("udp shutdown error", "err", err)
+		}
+		if err := tcpServer.ShutdownContext(shutdownCtx); err != nil {
+			slog.Error("tcp shutdown error", "err", err)
+		}
+		return nil
+	})
+
+	return g.Wait()
 }
 
 func (p *DNSFilter) Resolve(w dns.ResponseWriter, r *dns.Msg) {
+	// Panic Recovery Middleware
+	defer func() {
+		if r := recover(); r != nil {
+			atomic.AddUint64(&p.stats.ErrorsTotal, 1)
+			slog.Error("panic recovered", "err", r)
+		}
+	}()
+
+	atomic.AddUint64(&p.stats.RequestsTotal, 1)
+
 	if len(r.Question) == 0 {
 		return
 	}
 
-	// 1. Setup Context with Timeout
 	timeout := p.Config.RequestTimeout
 	if timeout == 0 {
 		timeout = 5 * time.Second
@@ -126,19 +192,35 @@ func (p *DNSFilter) Resolve(w dns.ResponseWriter, r *dns.Msg) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	// 2. Setup Structured Logger
 	clientIP, _, _ := net.SplitHostPort(w.RemoteAddr().String())
 	q := r.Question[0]
+
+	transport := "udp"
+	if _, ok := w.RemoteAddr().(*net.TCPAddr); ok {
+		transport = "tcp"
+	}
+
 	reqLogger := slog.With(
 		"id", r.Id,
 		"domain", q.Name,
 		"client_ip", clientIP,
+		"proto", transport,
 		"type", dns.TypeToString[q.Qtype],
 	)
 
-	// 3. Resolve
+	// Check Cache
+	cacheKey := p.Cache.GenerateKey(q)
+	if cachedMsg := p.Cache.Get(cacheKey); cachedMsg != nil {
+		reqLogger.Debug("cache hit")
+		atomic.AddUint64(&p.stats.CacheHits, 1)
+		cachedMsg.Id = r.Id // Restore ID to match request
+		_ = w.WriteMsg(cachedMsg)
+		return
+	}
+
 	resolvedMsg, err := p.ResolveDomain(ctx, q.Name, r.Id, reqLogger)
 	if err != nil {
+		atomic.AddUint64(&p.stats.ErrorsTotal, 1)
 		reqLogger.Error("resolve_domain failed", "error", err)
 		dnsErr := new(dns.Msg)
 		dnsErr.SetRcode(r, dns.RcodeServerFailure)
@@ -146,7 +228,13 @@ func (p *DNSFilter) Resolve(w dns.ResponseWriter, r *dns.Msg) {
 		return
 	}
 
-	// 4. Write Response
+	// Cache successful responses
+	if resolvedMsg.Rcode == dns.RcodeSuccess && len(resolvedMsg.Answer) > 0 {
+		p.Cache.Set(cacheKey, resolvedMsg)
+	} else if resolvedMsg.Rcode == dns.RcodeNameError {
+		p.Cache.Set(cacheKey, resolvedMsg)
+	}
+
 	if err := w.WriteMsg(resolvedMsg); err != nil {
 		reqLogger.Error("write_msg failed", "error", err)
 	}
@@ -158,18 +246,15 @@ func (p *DNSFilter) ResolveDomain(ctx context.Context, domain string, originalMs
 	m.SetQuestion(dns.Fqdn(domain), dns.TypeA)
 	m.Id = originalMsgID
 
-	// 1. Check Whitelist
 	if whitelistedMsg, ok := p.checkWhitelist(ctx, domain, m, logger); ok {
 		return whitelistedMsg, nil
 	}
 
-	// 2. Select Primary Resolver
 	firstResolver, err := p.getPrimaryResolver()
 	if err != nil {
 		return nil, err
 	}
 
-	// 3. Execute Resolution (Primary + Ads concurrently)
 	return p.resolveConcurrently(ctx, m, firstResolver, logger)
 }
 
@@ -212,7 +297,6 @@ func (p *DNSFilter) getPrimaryResolver() (*Resolver, error) {
 	return resolver, nil
 }
 
-// resultStruct helps gather concurrent results
 type resolveResult struct {
 	msg         *dns.Msg
 	gotFiltered bool
@@ -221,16 +305,24 @@ type resolveResult struct {
 
 func (p *DNSFilter) resolveConcurrently(ctx context.Context, m *dns.Msg, primary *Resolver, logger *slog.Logger) (*dns.Msg, error) {
 	g, gctx := errgroup.WithContext(ctx)
-
-	// Channel to capture results. Buffered to avoid blocking goroutines.
-	// Index 0: Primary, Index 1: Ads
 	results := make([]resolveResult, 2)
+
+	// Helper to safely execute resolver with panic recovery
+	safeResolve := func(r *Resolver, idx int) error {
+		defer func() {
+			if rec := recover(); rec != nil {
+				logger.Error("panic in resolver goroutine", "resolver", r.Name, "err", rec)
+				results[idx] = resolveResult{err: fmt.Errorf("panic in resolver: %v", rec)}
+			}
+		}()
+		msg, filtered, err := r.resolve(gctx, m.Copy(), logger.With("resolver", r.Name))
+		results[idx] = resolveResult{msg: msg, gotFiltered: filtered, err: err}
+		return err
+	}
 
 	// 1. Primary Resolver
 	g.Go(func() error {
-		msg, filtered, err := primary.resolve(gctx, m.Copy(), logger.With("resolver", primary.Name))
-		results[0] = resolveResult{msg: msg, gotFiltered: filtered, err: err}
-		return err // If primary fails, we might want to cancel everything
+		return safeResolve(primary, 0)
 	})
 
 	// 2. Ads Resolver (Optional)
@@ -240,36 +332,26 @@ func (p *DNSFilter) resolveConcurrently(ctx context.Context, m *dns.Msg, primary
 			if !exists {
 				return fmt.Errorf("resolver_anti_ads not found")
 			}
-			msg, filtered, err := adsResolver.resolve(gctx, m.Copy(), logger.With("resolver", adsResolver.Name))
-			results[1] = resolveResult{msg: msg, gotFiltered: filtered, err: err}
-			return err
+			return safeResolve(adsResolver, 1)
 		})
 	}
 
-	// Wait for completion
 	_ = g.Wait()
-	// Note: We ignore the error from Wait() intentionally here to process partial results or specific logic below,
-	// checking results[i].err individually.
 
 	rPrimary := results[0]
 	rAds := results[1]
 
-	// Priority 1: Primary blocked content (Malware/Porn)
 	if rPrimary.gotFiltered {
+		atomic.AddUint64(&p.stats.BlockedTotal, 1)
 		return rPrimary.msg, nil
 	}
-
-	// Priority 2: Ads blocked content
 	if p.Config.FilterAds && rAds.gotFiltered {
+		atomic.AddUint64(&p.stats.BlockedTotal, 1)
 		return rAds.msg, nil
 	}
-
-	// Priority 3: Return Primary valid response
 	if rPrimary.msg != nil {
 		return rPrimary.msg, rPrimary.err
 	}
-
-	// Fallback/Error handling
 	if rPrimary.err != nil {
 		return nil, rPrimary.err
 	}
@@ -284,7 +366,9 @@ func (p *DNSFilter) resolveConcurrently(ctx context.Context, m *dns.Msg, primary
 
 type Config struct {
 	ListenAddr     string        `yaml:"listen_addr"`
+	MetricsAddr    string        `yaml:"metrics_addr"`
 	RequestTimeout time.Duration `yaml:"request_timeout"`
+	CacheSize      int           `yaml:"cache_size"`
 
 	FilterMalware bool `yaml:"filter_malware"`
 	FilterPorn    bool `yaml:"filter_porn"`
@@ -314,140 +398,6 @@ func (c *Config) Validate() error {
 		if err := resolver.LoadAndValidate(false); err != nil {
 			return fmt.Errorf("resolver %s failed validation: %w", name, err)
 		}
-	}
-	return nil
-}
-
-// Resolver Definitions
-
-type Resolver struct {
-	dnsClient     dnsExchanger `yaml:"-"`
-	httpsClient   *http.Client `yaml:"-"`
-	Name          string       `yaml:"name"`
-	Addr          string       `yaml:"addr"`
-	URL           string       `yaml:"url"`
-	TLSServerName string       `yaml:"tls_server_name"`
-}
-
-func (resolver *Resolver) LoadAndValidate(isTest bool) error {
-	if err := validateAddrWithPort(resolver.Addr, isTest); err != nil {
-		return err
-	}
-
-	if resolver.URL != "" {
-		_, err := url.ParseRequestURI(resolver.URL)
-		if err != nil {
-			return fmt.Errorf("invalid URL: %w", err)
-		}
-		resolver.httpsClient = &http.Client{Timeout: 5 * time.Second}
-	} else {
-		// Initialize DNS client if not already mocked
-		if resolver.dnsClient == nil {
-			client := &dns.Client{
-				Net:       "tcp-tls",
-				Timeout:   5 * time.Second,
-				TLSConfig: &tls.Config{ServerName: resolver.TLSServerName},
-			}
-			resolver.dnsClient = &realDNSClient{client: client}
-		}
-	}
-	return nil
-}
-
-func (resolver *Resolver) resolve(ctx context.Context, m *dns.Msg, logger *slog.Logger) (*dns.Msg, bool, error) {
-	var err error
-	var resp *dns.Msg
-
-	if resolver.URL != "" {
-		m.SetEdns0(dns.DefaultMsgSize*2, false)
-		resp, err = resolver.makeHttpsRequest(ctx, m, logger)
-		if err != nil {
-			logger.Error("doh_exchange failed", "error", err)
-			return nil, false, fmt.Errorf("doh exchange failed: %w", err)
-		}
-	} else {
-		m.SetEdns0(dns.DefaultMsgSize*2, false)
-		resp, _, err = resolver.dnsClient.ExchangeContext(ctx, m, resolver.Addr)
-		if err != nil {
-			logger.Error("dns_exchange failed", "error", err)
-			return nil, false, fmt.Errorf("dns exchange failed: %w", err)
-		}
-	}
-
-	if resp == nil {
-		return nil, false, errors.New("resolver returned nil response")
-	}
-
-	// Logic to determine if response is a block
-	if resp.Rcode == dns.RcodeNameError {
-		logger.Info("blocked", "reason", "NXDOMAIN")
-		return resp, true, nil
-	}
-
-	for _, rr := range resp.Answer {
-		if a, ok := rr.(*dns.A); ok {
-			if a.A.String() == "0.0.0.0" {
-				logger.Info("blocked", "reason", "0.0.0.0")
-				return resp, true, nil
-			}
-		}
-	}
-	return resp, false, nil
-}
-
-func (rs *Resolver) makeHttpsRequest(ctx context.Context, reqMsg *dns.Msg, logger *slog.Logger) (*dns.Msg, error) {
-	wire, err := reqMsg.Pack()
-	if err != nil {
-		return nil, fmt.Errorf("pack failed: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", rs.URL, bytes.NewBuffer(wire))
-	if err != nil {
-		return nil, fmt.Errorf("http request creation failed: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/dns-udpwireformat")
-
-	resp, err := rs.httpsClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("http post failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("http status %d", resp.StatusCode)
-	}
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read body failed: %w", err)
-	}
-
-	respMsg := new(dns.Msg)
-	if err := respMsg.Unpack(respBody); err != nil {
-		return nil, fmt.Errorf("unpack failed: %w", err)
-	}
-	respMsg.SetEdns0(dns.DefaultMsgSize*4, false)
-	respMsg.SetReply(reqMsg)
-
-	return respMsg, nil
-}
-
-func validateAddrWithPort(addr string, isTest bool) error {
-	if addr == "" {
-		return errors.New("addr must be set")
-	}
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return fmt.Errorf("could not parse address: %w", err)
-	}
-	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
-		return fmt.Errorf("invalid port: %w", err)
-	}
-	if isTest {
-		return nil
-	}
-	if ip := net.ParseIP(host); ip == nil {
-		return fmt.Errorf("host '%s' is not a valid IP address", host)
 	}
 	return nil
 }

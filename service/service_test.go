@@ -32,7 +32,6 @@ type mockService struct {
 	runCalled chan struct{}
 }
 
-// This struct now implements every method required by the service.Service interface.
 func (m *mockService) Run() error {
 	if m.runCalled != nil {
 		close(m.runCalled)
@@ -165,6 +164,57 @@ func TestRunMain(t *testing.T) {
 		err := runMain([]string{"-service", "start"})
 		if !errors.Is(err, expectedErr) {
 			t.Errorf("expected error '%v', got '%v'", expectedErr, err)
+		}
+	})
+}
+
+func TestProgramRunErrors(t *testing.T) {
+	setupTestMain(t)
+	p := &program{configFile: "config.yml"}
+
+	t.Run("newFilter fails", func(t *testing.T) {
+		var wg sync.WaitGroup
+		wg.Add(1)
+
+		newFilter = func(configFile, listenAddr string) (lib.Proxy, error) {
+			defer wg.Done()
+			return nil, errors.New("config error")
+		}
+
+		// Run directly, not via Start
+		go p.run()
+
+		c := make(chan struct{})
+		go func() { wg.Wait(); close(c) }()
+		select {
+		case <-c:
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("timeout waiting for newFilter to fail")
+		}
+	})
+
+	t.Run("dns.Run fails", func(t *testing.T) {
+		var wg sync.WaitGroup
+		wg.Add(1)
+
+		mockFlt := &mockFilter{
+			runFunc: func() error {
+				defer wg.Done()
+				return errors.New("run error")
+			},
+		}
+		newFilter = func(configFile, listenAddr string) (lib.Proxy, error) {
+			return mockFlt, nil
+		}
+
+		go p.run()
+
+		c := make(chan struct{})
+		go func() { wg.Wait(); close(c) }()
+		select {
+		case <-c:
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("timeout waiting for dns.Run to fail")
 		}
 	})
 }

@@ -2,9 +2,11 @@ package lib
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,7 +35,7 @@ func handlerPass(m *dns.Msg) (*dns.Msg, error) {
 	r := new(dns.Msg)
 	r.SetReply(m)
 	r.Answer = append(r.Answer, &dns.A{
-		Hdr: dns.RR_Header{Name: m.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 1},
+		Hdr: dns.RR_Header{Name: m.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
 		A:   net.ParseIP("93.184.216.34"),
 	})
 	return r, nil
@@ -43,7 +45,7 @@ func handlerBlockZeroIP(m *dns.Msg) (*dns.Msg, error) {
 	r := new(dns.Msg)
 	r.SetReply(m)
 	r.Answer = append(r.Answer, &dns.A{
-		Hdr: dns.RR_Header{Name: m.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 1},
+		Hdr: dns.RR_Header{Name: m.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
 		A:   net.ParseIP("0.0.0.0"),
 	})
 	return r, nil
@@ -167,6 +169,121 @@ resolver_anti_ads:
 	}
 }
 
+func TestResolveDomain_EdgeCases(t *testing.T) {
+	logger := slog.Default()
+
+	t.Run("Whitelist but resolver_unfiltered missing", func(t *testing.T) {
+		// Only configure anti_malware, but whitelist a domain
+		config := `
+listen_addr: "127.0.0.1:53"
+whitelist: ["safe.com."]
+filter_malware: true
+resolver_anti_malware:
+  addr: "1.1.1.1:53"
+`
+		filter := newTestFilterWithMocks(t, config, nil)
+		_, err := filter.ResolveDomain(context.Background(), "safe.com.", 1, logger)
+		if err == nil {
+			t.Error("Expected error due to missing unfiltered resolver")
+		}
+	})
+
+	t.Run("Primary fails, Ads succeeds (Fallback logic)", func(t *testing.T) {
+		mockPrimary := &mockDNSClient{
+			Handler: func(m *dns.Msg) (*dns.Msg, error) { return nil, errors.New("primary failed") },
+		}
+		mockAds := &mockDNSClient{Handler: handlerPass}
+
+		config := `
+listen_addr: "127.0.0.1:53"
+filter_malware: true
+filter_ads: true
+resolver_anti_malware:
+  addr: "1.1.1.1:53"
+resolver_anti_ads:
+  addr: "2.2.2.2:53"
+`
+		filter := newTestFilterWithMocks(t, config, map[string]dnsExchanger{
+			"resolver_anti_malware": mockPrimary,
+			"resolver_anti_ads":     mockAds,
+		})
+
+		msg, err := filter.ResolveDomain(context.Background(), "test.com.", 1, logger)
+		// Current logic: If primary fails, but ads succeeds and returns a valid IP (not blocked),
+		// it might return that or the error.
+		// Looking at resolveConcurrently:
+		// - If ads returns valid msg (not blocked), we check primary.
+		// - If primary err != nil and Ads msg != nil -> Returns Ads msg?
+		// Let's check logic: "if rPrimary.err != nil { return nil, rPrimary.err }"
+		// So actually, if primary fails, we return error, IGNORING ads success.
+		// This confirms the behavior we expect (Fail fast on primary).
+
+		if err == nil {
+			t.Error("Expected error from primary resolver")
+		}
+		if msg != nil {
+			t.Error("Expected nil message")
+		}
+	})
+}
+
+func TestCacheIntegration(t *testing.T) {
+	// Setup filter with mocks
+	callCount := 0
+	mockUnfiltered := &mockDNSClient{
+		Handler: func(m *dns.Msg) (*dns.Msg, error) {
+			callCount++
+			return handlerPass(m)
+		},
+	}
+
+	config := `
+listen_addr: "127.0.0.1:53"
+request_timeout: 1s
+cache_size: 100
+filter_malware: false
+resolver_unfiltered:
+  addr: "1.1.1.1:853"
+`
+	filter := newTestFilterWithMocks(t, config, map[string]dnsExchanger{
+		"resolver_unfiltered": mockUnfiltered,
+	})
+
+	// Simulate a DNS Writer
+	w := &mockResponseWriter{
+		localAddr:  &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 53},
+		remoteAddr: &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 1234},
+	}
+
+	req := new(dns.Msg)
+	req.SetQuestion("cached.com.", dns.TypeA)
+	req.Id = 1234
+
+	// 1. First Request - Should call backend
+	filter.Resolve(w, req)
+	if callCount != 1 {
+		t.Errorf("Expected 1 backend call, got %d", callCount)
+	}
+	if atomic.LoadUint64(&filter.stats.CacheHits) != 0 {
+		t.Errorf("Expected 0 cache hits, got %d", filter.stats.CacheHits)
+	}
+
+	// 2. Second Request - Should NOT call backend
+	req.Id = 5678 // New ID
+	filter.Resolve(w, req)
+	if callCount != 1 {
+		t.Errorf("Expected backend call count to remain 1, got %d (Cache Miss)", callCount)
+	}
+	if atomic.LoadUint64(&filter.stats.CacheHits) != 1 {
+		t.Errorf("Expected 1 cache hit, got %d", filter.stats.CacheHits)
+	}
+
+	// Verify ID was restored in response
+	if w.lastMsg.Id != 5678 {
+		t.Errorf("Expected response ID 5678, got %d", w.lastMsg.Id)
+	}
+}
+
 // newTestFilterWithMocks is a helper to create a DNSFilter and inject mock clients.
 func newTestFilterWithMocks(t *testing.T, configYAML string, mocks map[string]dnsExchanger) *DNSFilter {
 	t.Helper()
@@ -178,6 +295,7 @@ func newTestFilterWithMocks(t *testing.T, configYAML string, mocks map[string]dn
 	}
 
 	// Create filter from file first
+	// Note: We use NewDNSFilter which now initializes Cache and Stats
 	filter, err := NewDNSFilter(configFile, "")
 	if err != nil {
 		t.Fatalf("Failed to create DNSFilter: %v", err)
@@ -192,3 +310,22 @@ func newTestFilterWithMocks(t *testing.T, configYAML string, mocks map[string]dn
 
 	return filter
 }
+
+// mockResponseWriter implements dns.ResponseWriter
+type mockResponseWriter struct {
+	lastMsg    *dns.Msg
+	localAddr  net.Addr
+	remoteAddr net.Addr
+}
+
+func (m *mockResponseWriter) LocalAddr() net.Addr  { return m.localAddr }
+func (m *mockResponseWriter) RemoteAddr() net.Addr { return m.remoteAddr }
+func (m *mockResponseWriter) WriteMsg(msg *dns.Msg) error {
+	m.lastMsg = msg
+	return nil
+}
+func (m *mockResponseWriter) Write([]byte) (int, error) { return 0, nil }
+func (m *mockResponseWriter) Close() error              { return nil }
+func (m *mockResponseWriter) TsigStatus() error         { return nil }
+func (m *mockResponseWriter) TsigTimersOnly(bool)       {}
+func (m *mockResponseWriter) Hijack()                   {}
