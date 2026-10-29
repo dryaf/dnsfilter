@@ -1,0 +1,20 @@
+[Unit]
+Description=DNS filter and proxy
+Wants=network-online.target
+After=network-online.target
+{% if wg_enabled | bool %}
+Requires=wg-quick@wg0.service
+After=wg-quick@wg0.service
+{% endif %}
+
+[Service]
+Type=simple
+User={{ service_user }}
+Group={{ service_group }}
+ExecStart={{ target_bin }} -configFile {{ target_config }}
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=multi-user.target

@@ -3,8 +3,13 @@ package lib
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +18,6 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
-	"golang.org/x/exp/slog"
 )
 
 // --- Mock DNS Client ---
@@ -69,8 +73,6 @@ func TestResolveDomainWithMocks(t *testing.T) {
 
 	baseConfig := `
 listen_addr: "127.0.0.1:53"
-whitelist:
-  - "whitelisted.com."
 resolver_unfiltered:
   addr: "1.1.1.1:853"
 resolver_anti_malware:
@@ -116,7 +118,7 @@ resolver_anti_ads:
 		{
 			name:       "Whitelisted domain should pass even with all filters",
 			domain:     "whitelisted.com.",
-			configExt:  "filter_malware: true\nfilter_ads: true",
+			configExt:  "whitelist: [whitelisted.com.]\nfilter_malware: true\nfilter_ads: true",
 			wantBlock:  false,
 			wantResult: "93.184.216.34",
 		},
@@ -182,19 +184,17 @@ resolver_anti_ads:
 func TestResolveDomain_EdgeCases(t *testing.T) {
 	logger := slog.Default()
 
-	t.Run("Whitelist but resolver_unfiltered missing", func(t *testing.T) {
-		// Only configure anti_malware, but whitelist a domain
-		config := `
-listen_addr: "127.0.0.1:53"
-whitelist: ["safe.com."]
-filter_malware: true
-resolver_anti_malware:
-  addr: "1.1.1.1:53"
-`
-		filter := newTestFilterWithMocks(t, config, nil)
+	t.Run("Whitelist missing resolver does not fall through to filtering", func(t *testing.T) {
+		var calls atomic.Int32
+		filter := &DNSFilter{Config: &Config{Whitelist: []string{"safe.com."}, FilterMalware: true, Resolvers: map[string]*Resolver{
+			"resolver_anti_malware": {dnsClient: &mockDNSClient{Handler: func(m *dns.Msg) (*dns.Msg, error) {
+				calls.Add(1)
+				return handlerBlockNXDOMAIN(m)
+			}}},
+		}}, stats: &Stats{}}
 		_, err := filter.ResolveDomain(context.Background(), "safe.com.", 1, logger)
-		if err == nil {
-			t.Error("Expected error due to missing unfiltered resolver")
+		if err == nil || calls.Load() != 0 {
+			t.Errorf("missing whitelist resolver: err=%v filter calls=%d", err, calls.Load())
 		}
 	})
 
@@ -278,6 +278,7 @@ func TestCacheIntegration(t *testing.T) {
 listen_addr: "127.0.0.1:53"
 request_timeout: 1s
 cache_size: 100
+allowed_clients: ["10.0.0.0/24"]
 filter_malware: false
 resolver_unfiltered:
   addr: "1.1.1.1:853"
@@ -318,6 +319,220 @@ resolver_unfiltered:
 	// Verify ID was restored in response
 	if w.lastMsg.Id != 5678 {
 		t.Errorf("Expected response ID 5678, got %d", w.lastMsg.Id)
+	}
+}
+
+func TestResolvePreservesQuestion(t *testing.T) {
+	for _, whitelisted := range []bool{false, true} {
+		for _, record := range []string{
+			"example.com. 60 IN A 192.0.2.1",
+			"example.com. 60 IN AAAA 2001:db8::1",
+			"example.com. 60 IN MX 10 mail.example.com.",
+			"example.com. 60 IN TXT \"test\"",
+			"example.com. 60 CH TXT \"version\"",
+		} {
+			t.Run(fmt.Sprintf("whitelist=%t/%s", whitelisted, record), func(t *testing.T) {
+				rr, err := dns.NewRR(record)
+				if err != nil {
+					t.Fatal(err)
+				}
+				request := new(dns.Msg).SetQuestion(rr.Header().Name, rr.Header().Rrtype)
+				request.Question[0].Qclass = rr.Header().Class
+				request.RecursionDesired = false
+				request.CheckingDisabled = true
+				request.AuthenticatedData = true
+				var upstream *dns.Msg
+				filter := &DNSFilter{
+					Config: &Config{Resolvers: map[string]*Resolver{
+						"resolver_unfiltered": {dnsClient: &mockDNSClient{Handler: func(m *dns.Msg) (*dns.Msg, error) {
+							upstream = m.Copy()
+							reply := new(dns.Msg).SetReply(m)
+							reply.Answer = []dns.RR{dns.Copy(rr)}
+							return reply, nil
+						}}},
+					}},
+					Cache: NewDNSCache(10, 1), stats: &Stats{},
+				}
+				if whitelisted {
+					filter.Config.Whitelist = []string{request.Question[0].Name}
+				}
+				writer := &mockResponseWriter{remoteAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 53000}}
+				filter.Resolve(writer, request)
+				if upstream == nil || writer.lastMsg == nil {
+					t.Fatal("missing upstream request or client response")
+				}
+				if upstream.Question[0] != request.Question[0] || writer.lastMsg.Question[0] != request.Question[0] {
+					t.Fatalf("question changed: request=%v upstream=%v reply=%v", request.Question, upstream.Question, writer.lastMsg.Question)
+				}
+				if upstream.RecursionDesired || !upstream.CheckingDisabled || !upstream.AuthenticatedData {
+					t.Errorf("request flags changed: %v", upstream.MsgHdr)
+				}
+				if got := writer.lastMsg.Answer[0].Header().Rrtype; got != request.Question[0].Qtype {
+					t.Errorf("answer type=%d, want %d", got, request.Question[0].Qtype)
+				}
+				request.Id++
+				filter.Resolve(writer, request)
+				if writer.lastMsg.Id != request.Id || writer.lastMsg.Question[0] != request.Question[0] {
+					t.Errorf("cached response does not match request: %v", writer.lastMsg)
+				}
+			})
+		}
+	}
+}
+
+func TestCacheSeparatesRequestSemantics(t *testing.T) {
+	calls := 0
+	filter := &DNSFilter{
+		Config: &Config{Resolvers: map[string]*Resolver{
+			"resolver_unfiltered": {dnsClient: &mockDNSClient{Handler: func(m *dns.Msg) (*dns.Msg, error) {
+				calls++
+				reply, err := handlerPass(m)
+				if opt := m.IsEdns0(); opt != nil {
+					reply.SetEdns0(opt.UDPSize(), opt.Do())
+				}
+				return reply, err
+			}}},
+		}},
+		Cache: NewDNSCache(10, 1), stats: &Stats{},
+	}
+	variants := []struct {
+		name   string
+		change func(*dns.Msg)
+	}{
+		{"default", func(*dns.Msg) {}},
+		{"no recursion", func(m *dns.Msg) { m.RecursionDesired = false }},
+		{"checking disabled", func(m *dns.Msg) { m.CheckingDisabled = true }},
+		{"authenticated data", func(m *dns.Msg) { m.AuthenticatedData = true }},
+		{"EDNS", func(m *dns.Msg) { m.SetEdns0(1232, false) }},
+		{"DNSSEC", func(m *dns.Msg) { m.SetEdns0(1232, true) }},
+	}
+	writer := &mockResponseWriter{remoteAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 53000}}
+	for i, variant := range variants {
+		t.Run(variant.name, func(t *testing.T) {
+			query := new(dns.Msg).SetQuestion("example.com.", dns.TypeA)
+			variant.change(query)
+			filter.Resolve(writer, query)
+			if calls != i+1 {
+				t.Fatalf("different request reused another response: backend calls=%d, want %d", calls, i+1)
+			}
+			query.Id++
+			if opt := query.IsEdns0(); opt != nil {
+				opt.SetUDPSize(512)
+			}
+			filter.Resolve(writer, query)
+			if calls != i+1 {
+				t.Errorf("identical request missed cache: backend calls=%d", calls)
+			}
+			if writer.lastMsg.Id != query.Id {
+				t.Error("cached response ID was not restored")
+			}
+			if opt := query.IsEdns0(); opt != nil {
+				got := writer.lastMsg.IsEdns0()
+				if got == nil || got.Do() != opt.Do() {
+					t.Errorf("cached response lost EDNS/DNSSEC: %v", got)
+				}
+			}
+		})
+	}
+	query := new(dns.Msg).SetQuestion("example.com.", dns.TypeA)
+	query.SetEdns0(1232, false)
+	query.IsEdns0().Option = []dns.EDNS0{&dns.EDNS0_LOCAL{Code: 65001, Data: []byte{1}}}
+	for i := 0; i < 2; i++ {
+		filter.Resolve(writer, query)
+	}
+	if calls != len(variants)+2 {
+		t.Errorf("transaction-specific EDNS query was cached: calls=%d", calls)
+	}
+}
+
+func TestUDPResponseLimitsAndTCPFallback(t *testing.T) {
+	for _, advertised := range []uint16{0, 128, 512, 1232, 4096} {
+		t.Run(fmt.Sprintf("EDNS-size=%d", advertised), func(t *testing.T) {
+			calls := 0
+			filter := &DNSFilter{
+				Config: &Config{Resolvers: map[string]*Resolver{
+					"resolver_unfiltered": {dnsClient: &mockDNSClient{Handler: func(query *dns.Msg) (*dns.Msg, error) {
+						calls++
+						reply := new(dns.Msg).SetReply(query)
+						for i := 1; i <= 100; i++ {
+							reply.Answer = append(reply.Answer, &dns.A{Hdr: dns.RR_Header{Name: query.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: net.IPv4(192, 0, 2, byte(i))})
+						}
+						return reply, nil
+					}}},
+				}},
+				Cache: NewDNSCache(10, 1), stats: &Stats{},
+			}
+			query := new(dns.Msg).SetQuestion("large.example.", dns.TypeA)
+			limit := dns.MinMsgSize
+			if advertised != 0 {
+				query.SetEdns0(advertised, false)
+				limit = min(1232, max(512, int(advertised)))
+			}
+			writer := &mockResponseWriter{remoteAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 53000}}
+			for attempt := 0; attempt < 2; attempt++ {
+				query.Id++
+				filter.Resolve(writer, query)
+				wire, err := writer.lastMsg.Pack()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(wire) > limit || !writer.lastMsg.Truncated {
+					t.Errorf("attempt %d: %d bytes, TC=%v; want <=%d and TC=true", attempt, len(wire), writer.lastMsg.Truncated, limit)
+				}
+				if (writer.lastMsg.IsEdns0() != nil) != (advertised != 0) {
+					t.Error("response EDNS does not match client support")
+				}
+			}
+			writer.remoteAddr = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 53000}
+			filter.Resolve(writer, query)
+			if writer.lastMsg.Truncated || len(writer.lastMsg.Answer) != 100 {
+				t.Fatalf("TCP fallback received an incomplete cached answer: %v", writer.lastMsg)
+			}
+			if calls != 1 {
+				t.Errorf("expected one upstream call, got %d", calls)
+			}
+		})
+	}
+}
+
+func TestMetricsDuringResolution(t *testing.T) {
+	filter := &DNSFilter{
+		Config: &Config{Resolvers: map[string]*Resolver{
+			"resolver_unfiltered": {dnsClient: &mockDNSClient{Handler: handlerPass}},
+		}},
+		Cache: NewDNSCache(10, 1), stats: &Stats{},
+	}
+	const count = 1000
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		writer := &mockResponseWriter{remoteAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 53000}}
+		query := new(dns.Msg).SetQuestion("example.com.", dns.TypeA)
+		for i := 0; i < count; i++ {
+			filter.Resolve(writer, query)
+		}
+	}()
+	handler := filter.metricsHandler()
+	readMetrics := func() Stats {
+		t.Helper()
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "application/json" {
+			t.Errorf("unexpected metrics response: %v", response.Result())
+		}
+		var stats Stats
+		if err := json.Unmarshal(response.Body.Bytes(), &stats); err != nil {
+			t.Fatal(err)
+		}
+		return stats
+	}
+	for i := 0; i < count; i++ {
+		readMetrics()
+	}
+	<-done
+	stats := readMetrics()
+	if stats.RequestsTotal != count || stats.CacheHits != count-1 || stats.ErrorsTotal != 0 {
+		t.Errorf("unexpected final metrics: %+v", stats)
 	}
 }
 

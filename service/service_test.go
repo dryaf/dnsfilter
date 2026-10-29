@@ -1,237 +1,247 @@
 package main
 
 import (
+	"context"
 	"errors"
-	"sync"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/dryaf/dnsfilter/lib"
 	"github.com/kardianos/service"
+
+	"github.com/dryaf/dnsfilter/lib"
 )
 
-// mockFilter implements the lib.Proxy interface for testing.
-type mockFilter struct {
-	runFunc func() error
-}
+type mockFilter struct{ runFunc func(context.Context) error }
 
-func (m *mockFilter) Run() error {
+func (m *mockFilter) RunContext(ctx context.Context) error { return m.runFunc(ctx) }
+
+type mockService struct{ runFunc func() error }
+
+func (m *mockService) Run() error {
 	if m.runFunc != nil {
 		return m.runFunc()
 	}
 	return nil
 }
-
-// mockService is a complete and correct implementation of the service.Service interface for testing.
-type mockService struct {
-	runCalled chan struct{}
-}
-
-func (m *mockService) Run() error {
-	if m.runCalled != nil {
-		close(m.runCalled)
-	}
-	return nil
-}
-func (m *mockService) Start() error   { return nil }
-func (m *mockService) Stop() error    { return nil }
-func (m *mockService) Restart() error { return nil }
-func (m *mockService) Install() error { return nil }
-func (m *mockService) Uninstall() error {
-	return nil
-}
+func (m *mockService) Start() error                    { return nil }
+func (m *mockService) Stop() error                     { return nil }
+func (m *mockService) Restart() error                  { return nil }
+func (m *mockService) Install() error                  { return nil }
+func (m *mockService) Uninstall() error                { return nil }
 func (m *mockService) Status() (service.Status, error) { return service.StatusUnknown, nil }
 func (m *mockService) String() string                  { return "mockService" }
 func (m *mockService) Platform() string                { return "mock" }
-func (m *mockService) Logger(errs chan<- error) (service.Logger, error) {
+func (m *mockService) Logger(chan<- error) (service.Logger, error) {
 	return nil, errors.New("not implemented")
 }
-func (m *mockService) SystemLogger(errs chan<- error) (service.Logger, error) {
+func (m *mockService) SystemLogger(chan<- error) (service.Logger, error) {
 	return nil, errors.New("not implemented")
 }
 
 func setupTestMain(t *testing.T) {
 	t.Helper()
-	// Keep original functions
-	originalServiceNew := serviceNew
-	originalServiceControl := serviceControl
-	originalNewFilter := newFilter
-
-	// Restore original functions after the test
+	originalServiceNew, originalServiceControl, originalNewFilter := serviceNew, serviceControl, newFilter
 	t.Cleanup(func() {
-		serviceNew = originalServiceNew
-		serviceControl = originalServiceControl
-		newFilter = originalNewFilter
+		serviceNew, serviceControl, newFilter = originalServiceNew, originalServiceControl, originalNewFilter
 	})
 }
 
 func TestRunMain(t *testing.T) {
-	setupTestMain(t)
-
-	t.Run("runs as service", func(t *testing.T) {
-		mockSvc := &mockService{runCalled: make(chan struct{})}
-		serviceNew = func(p service.Interface, c *service.Config) (service.Service, error) {
-			return mockSvc, nil
+	t.Run("runs service synchronously", func(t *testing.T) {
+		setupTestMain(t)
+		called := false
+		serviceNew = func(service.Interface, *service.Config) (service.Service, error) {
+			return &mockService{runFunc: func() error { called = true; return nil }}, nil
 		}
-
-		errCh := make(chan error, 1)
-		go func() {
-			errCh <- runMain([]string{"-configFile", "test.yml"})
-		}()
-
-		select {
-		case <-mockSvc.runCalled:
-			// Success
-		case err := <-errCh:
-			t.Fatalf("runMain exited unexpectedly with error: %v", err)
-		case <-time.After(100 * time.Millisecond):
-			t.Fatal("timed out waiting for service.Run to be called")
+		if err := runMain([]string{"-configFile", "test.yml"}); err != nil {
+			t.Fatal(err)
+		}
+		if !called {
+			t.Fatal("service.Run was not called")
 		}
 	})
-
-	t.Run("controls service with install flag", func(t *testing.T) {
-		mockSvc := &mockService{}
-		controlCalled := make(chan string)
-
-		serviceNew = func(p service.Interface, c *service.Config) (service.Service, error) {
-			return mockSvc, nil
-		}
-		serviceControl = func(s service.Service, action string) error {
-			close(controlCalled)
+	t.Run("install needs no runtime configuration", func(t *testing.T) {
+		setupTestMain(t)
+		serviceNew = func(service.Interface, *service.Config) (service.Service, error) { return &mockService{}, nil }
+		called := false
+		serviceControl = func(_ service.Service, action string) error {
+			called = true
 			if action != "install" {
-				return errors.New("expected action 'install'")
+				t.Errorf("action=%s", action)
 			}
 			return nil
 		}
-
+		newFilter = func(string, string) (lib.Proxy, error) {
+			t.Error("install initialized DNS")
+			return nil, errors.New("unexpected call")
+		}
 		if err := runMain([]string{"-service", "install"}); err != nil {
-			t.Fatalf("runMain returned an error: %v", err)
+			t.Fatal(err)
 		}
-
-		select {
-		case <-controlCalled:
-			// Success
-		case <-time.After(100 * time.Millisecond):
-			t.Fatal("timed out waiting for service.Control to be called")
+		if !called {
+			t.Fatal("service.Control was not called")
 		}
 	})
-
-	t.Run("sets wg dependencies", func(t *testing.T) {
-		serviceNew = func(p service.Interface, c *service.Config) (service.Service, error) {
-			// Check that the config was modified before creating the service
-			if len(c.Dependencies) != 3 {
-				t.Fatalf("expected 3 dependencies with -wg flag, got %d", len(c.Dependencies))
+	t.Run("WireGuard dependencies do not leak between invocations", func(t *testing.T) {
+		setupTestMain(t)
+		want := 3
+		serviceNew = func(_ service.Interface, config *service.Config) (service.Service, error) {
+			if len(config.Dependencies) != want {
+				t.Errorf("dependencies=%v, want %d", config.Dependencies, want)
 			}
-			if c.Dependencies[2] != "Requires=wg-quick@wg0.service" {
-				t.Errorf("unexpected dependency: %s", c.Dependencies[2])
+			if want == 3 && len(config.Dependencies) == 3 && config.Dependencies[2] != "Requires=wg-quick@wg0.service" {
+				t.Error("missing WireGuard dependency")
 			}
-			return &mockService{runCalled: make(chan struct{})}, nil
-		}
-
-		// Run in a goroutine because it blocks on s.Run()
-		go func() { _ = runMain([]string{"-wg"}) }()
-	})
-
-	t.Run("handles service.New error", func(t *testing.T) {
-		expectedErr := errors.New("service new failed")
-		serviceNew = func(p service.Interface, c *service.Config) (service.Service, error) {
-			return nil, expectedErr
-		}
-
-		err := runMain([]string{})
-		if !errors.Is(err, expectedErr) {
-			t.Errorf("expected error '%v', got '%v'", expectedErr, err)
-		}
-	})
-
-	t.Run("handles service.Control error", func(t *testing.T) {
-		expectedErr := errors.New("service control failed")
-		serviceNew = func(p service.Interface, c *service.Config) (service.Service, error) {
 			return &mockService{}, nil
 		}
-		serviceControl = func(s service.Service, action string) error {
-			return expectedErr
+		if err := runMain([]string{"-wg"}); err != nil {
+			t.Fatal(err)
 		}
-
-		err := runMain([]string{"-service", "start"})
-		if !errors.Is(err, expectedErr) {
-			t.Errorf("expected error '%v', got '%v'", expectedErr, err)
+		want = 1
+		if err := runMain(nil); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("service construction error", func(t *testing.T) {
+		setupTestMain(t)
+		want := errors.New("service construction failed")
+		serviceNew = func(service.Interface, *service.Config) (service.Service, error) { return nil, want }
+		if err := runMain(nil); !errors.Is(err, want) {
+			t.Fatalf("error=%v, want %v", err, want)
+		}
+	})
+	t.Run("service control error", func(t *testing.T) {
+		setupTestMain(t)
+		want := errors.New("service control failed")
+		serviceNew = func(service.Interface, *service.Config) (service.Service, error) { return &mockService{}, nil }
+		serviceControl = func(service.Service, string) error { return want }
+		if err := runMain([]string{"-service", "start"}); !errors.Is(err, want) {
+			t.Fatalf("error=%v, want %v", err, want)
+		}
+	})
+	t.Run("invalid flag returns an error", func(t *testing.T) {
+		if err := runMain([]string{"-unknown"}); err == nil {
+			t.Fatal("expected a flag error")
+		}
+	})
+	t.Run("help exits successfully", func(t *testing.T) {
+		if err := runMain([]string{"-h"}); err != nil {
+			t.Fatal(err)
 		}
 	})
 }
 
-func TestProgramRunErrors(t *testing.T) {
-	setupTestMain(t)
-	p := &program{configFile: "config.yml"}
-
-	t.Run("newFilter fails", func(t *testing.T) {
-		called := make(chan struct{})
-		var once sync.Once
-		newFilter = func(configFile, listenAddr string) (lib.Proxy, error) {
-			once.Do(func() { close(called) })
-			return nil, errors.New("config error")
+func TestRunMainPropagatesDNSErrors(t *testing.T) {
+	for _, duringStartup := range []bool{true, false} {
+		name := "listener failure"
+		if duringStartup {
+			name = "invalid configuration"
 		}
-
-		go p.run()
-
-		select {
-		case <-called:
-		case <-time.After(100 * time.Millisecond):
-			t.Fatal("timeout waiting for newFilter to fail")
-		}
-	})
-
-	t.Run("dns.Run fails", func(t *testing.T) {
-		called := make(chan struct{})
-		var once sync.Once
-		mockFlt := &mockFilter{
-			runFunc: func() error {
-				once.Do(func() { close(called) })
-				return errors.New("run error")
-			},
-		}
-		newFilter = func(configFile, listenAddr string) (lib.Proxy, error) {
-			return mockFlt, nil
-		}
-
-		go p.run()
-
-		select {
-		case <-called:
-		case <-time.After(100 * time.Millisecond):
-			t.Fatal("timeout waiting for dns.Run to fail")
-		}
-	})
+		t.Run(name, func(t *testing.T) {
+			setupTestMain(t)
+			want := errors.New(name)
+			newFilter = func(string, string) (lib.Proxy, error) {
+				if duringStartup {
+					return nil, want
+				}
+				return &mockFilter{runFunc: func(context.Context) error { return want }}, nil
+			}
+			serviceNew = func(p service.Interface, config *service.Config) (service.Service, error) {
+				return &mockService{runFunc: func() error {
+					if err := p.Start(nil); err != nil {
+						return err
+					}
+					config.Option["RunWait"].(func())()
+					return p.Stop(nil)
+				}}, nil
+			}
+			done := make(chan error, 1)
+			go func() { done <- runMain([]string{"-configFile", "test.yml"}) }()
+			select {
+			case err := <-done:
+				if !errors.Is(err, want) {
+					t.Fatalf("error=%v, want %v", err, want)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("DNS failure did not terminate the service")
+			}
+		})
+	}
 }
 
-func TestProgramStartAndStop(t *testing.T) {
+func TestProgramStopCancelsAndWaits(t *testing.T) {
 	setupTestMain(t)
-	runCalled := make(chan struct{})
-	var once sync.Once
-
-	mockFlt := &mockFilter{
-		runFunc: func() error {
-			once.Do(func() { close(runCalled) })
+	started, stopped := make(chan struct{}), make(chan struct{})
+	newFilter = func(string, string) (lib.Proxy, error) {
+		return &mockFilter{runFunc: func(ctx context.Context) error {
+			close(started)
+			<-ctx.Done()
+			close(stopped)
 			return nil
-		},
+		}}, nil
 	}
-	newFilter = func(configFile, listenAddr string) (lib.Proxy, error) {
-		return mockFlt, nil
-	}
-
 	p := &program{}
 	if err := p.Start(nil); err != nil {
-		t.Fatalf("p.Start() returned an error: %v", err)
+		t.Fatal(err)
 	}
-
-	select {
-	case <-runCalled:
-		// test passed
-	case <-time.After(1 * time.Second):
-		t.Fatal("timed out waiting for program.run to be called")
-	}
-
+	<-started
 	if err := p.Stop(nil); err != nil {
-		t.Fatalf("p.Stop() returned an error: %v", err)
+		t.Fatal(err)
+	}
+	select {
+	case <-stopped:
+	default:
+		t.Fatal("Stop returned before DNS shut down")
+	}
+}
+
+func TestProgramUnexpectedExitIsFailure(t *testing.T) {
+	setupTestMain(t)
+	newFilter = func(string, string) (lib.Proxy, error) {
+		return &mockFilter{runFunc: func(context.Context) error { return nil }}, nil
+	}
+	p := &program{}
+	if err := p.Start(nil); err != nil {
+		t.Fatal(err)
+	}
+	p.wait()
+	if err := p.Stop(nil); err == nil {
+		t.Fatal("unexpected DNS exit must fail the service")
+	}
+}
+
+func TestConfigurationCheckDoesNotStartService(t *testing.T) {
+	setupTestMain(t)
+	serviceNew = func(service.Interface, *service.Config) (service.Service, error) {
+		t.Fatal("configuration check constructed a service")
+		return nil, nil
+	}
+	newFilter = func(string, string) (lib.Proxy, error) {
+		t.Fatal("configuration check initialized listeners or a cache")
+		return nil, nil
+	}
+	for _, tc := range []struct {
+		name, config string
+		wantError    bool
+	}{
+		{"valid", "listen_addr: 127.0.0.1:53\nresolver_unfiltered:\n  addr: 127.0.0.1:853\n", false},
+		{"missing resolver", "listen_addr: 127.0.0.1:53\n", true},
+		{"malformed YAML", "listen_addr: [\n", true},
+		{"duplicate setting", "listen_addr: 127.0.0.1:53\nlisten_addr: 127.0.0.1:54\n", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yml")
+			if err := os.WriteFile(path, []byte(tc.config), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := runMain([]string{"-checkConfig", "-configFile", path}); (err != nil) != tc.wantError {
+				t.Fatalf("checkConfig error=%v, wantError=%v", err, tc.wantError)
+			}
+		})
+	}
+	if err := runMain([]string{"-checkConfig", "-service", "restart"}); err == nil {
+		t.Fatal("accepted conflicting validation and service control")
 	}
 }

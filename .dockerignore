@@ -1,0 +1,5 @@
+# Only the executable and build recipe belong in the image build context.
+# deploy transfers config.yml separately for the read-only runtime mount.
+*
+!Containerfile
+!dns-filter

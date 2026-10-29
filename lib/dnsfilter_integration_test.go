@@ -1,6 +1,7 @@
 package lib
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -14,30 +15,32 @@ import (
 	"github.com/miekg/dns"
 )
 
-// GetFreePort asks the kernel for a free open port that is ready to use.
-func GetFreePort() (int, error) {
-	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
-	if err != nil {
-		return 0, err
+// Reserve the addresses together so the kernel cannot return the same port
+// for DNS and metrics after an earlier temporary listener has been closed.
+func getFreeTestPorts(t *testing.T, count int) []int {
+	t.Helper()
+	var listeners []net.Listener
+	defer func() {
+		for _, listener := range listeners {
+			_ = listener.Close()
+		}
+	}()
+	var ports []int
+	for range count {
+		listener, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		listeners = append(listeners, listener)
+		ports = append(ports, listener.Addr().(*net.TCPAddr).Port)
 	}
-	l, err := net.ListenTCP("tcp", addr)
-	if err != nil {
-		return 0, err
-	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port, nil
+	return ports
 }
 
 func TestIntegration_RunAndResolve(t *testing.T) {
 	// 1. Prepare Environment
-	dnsPort, err := GetFreePort()
-	if err != nil {
-		t.Fatal(err)
-	}
-	metricsPort, err := GetFreePort()
-	if err != nil {
-		t.Fatal(err)
-	}
+	ports := getFreeTestPorts(t, 2)
+	dnsPort, metricsPort := ports[0], ports[1]
 
 	// Create a dummy config
 	configContent := fmt.Sprintf(`
@@ -71,6 +74,9 @@ resolver_anti_ads:
 	// Mock the resolvers inside the filter to avoid external network calls during integration test
 	mockResolver := &mockDNSClient{
 		Handler: func(m *dns.Msg) (*dns.Msg, error) {
+			if m.Question[0].Name == "panic.com." {
+				panic("forced panic")
+			}
 			r := new(dns.Msg)
 			r.SetReply(m)
 			r.Answer = append(r.Answer, &dns.A{
@@ -84,13 +90,27 @@ resolver_anti_ads:
 	filter.Config.Resolvers["resolver_anti_ads"].dnsClient = mockResolver
 
 	// 3. Run Server in Goroutine
+	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
+	stopped := false
+	t.Cleanup(func() {
+		cancel()
+		if !stopped {
+			select {
+			case err := <-errCh:
+				if err != nil {
+					t.Error(err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Error("DNS service did not stop during cleanup")
+			}
+		}
+	})
 	go func() {
-		errCh <- filter.Run()
+		errCh <- filter.RunContext(ctx)
 	}()
 
-	// Wait for startup (simple sleep usually sufficient for tests, or poll metrics port)
-	time.Sleep(200 * time.Millisecond)
+	waitForHealth(t, filter.Config.MetricsAddr)
 
 	// 4. Test DNS Resolution (UDP)
 	c := new(dns.Client)
@@ -104,6 +124,11 @@ resolver_anti_ads:
 	if r == nil || len(r.Answer) == 0 {
 		t.Fatal("Expected answer, got empty")
 	}
+	c.Net = "tcp"
+	if r, _, err := c.Exchange(m, filter.Config.ListenAddr); err != nil || r == nil || len(r.Answer) == 0 {
+		t.Fatalf("TCP resolution failed: response=%v error=%v", r, err)
+	}
+	c.Net = "udp"
 
 	// 5. Test Metrics Endpoint
 	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", metricsPort))
@@ -115,41 +140,32 @@ resolver_anti_ads:
 	}
 	resp.Body.Close()
 
-	// 6. Test Panic Recovery
-	// Inject a panic into the resolver logic
-	filter.Config.Resolvers["resolver_unfiltered"].dnsClient = &mockDNSClient{
-		Handler: func(m *dns.Msg) (*dns.Msg, error) {
-			panic("forced panic")
-		},
-	}
-
-	// Send request that should panic
+	// 6. The mock's panic behavior was installed before starting the service.
 	mPanic := new(dns.Msg)
 	mPanic.SetQuestion("panic.com.", dns.TypeA)
-	_, _, _ = c.Exchange(mPanic, fmt.Sprintf("127.0.0.1:%d", dnsPort))
-
-	// Wait a moment for stats to update
-	time.Sleep(50 * time.Millisecond)
+	panicReply, _, err := c.Exchange(mPanic, filter.Config.ListenAddr)
+	if err != nil || panicReply == nil || panicReply.Rcode != dns.RcodeServerFailure {
+		t.Fatalf("panic did not produce SERVFAIL: response=%v error=%v", panicReply, err)
+	}
 
 	// Check if errors incremented
 	if atomic.LoadUint64(&filter.stats.ErrorsTotal) == 0 {
 		t.Error("Expected ErrorsTotal to increment after panic")
 	}
 
-	// 7. Cleanup is handled by test timeout or killing the process,
-	// strictly speaking we should cancel the context of Run(),
-	// but Run() waits for Signal. We can send a signal.
-	proc, _ := os.FindProcess(os.Getpid())
-	proc.Signal(os.Interrupt)
+	// 7. Cancellation must stop DNS and HTTP before RunContext returns.
+	cancel()
 
 	select {
 	case err := <-errCh:
+		stopped = true
 		if err != nil {
 			t.Errorf("Run() exited with error: %v", err)
 		}
-	case <-time.After(1 * time.Second):
-		// t.Log("Timeout waiting for server shutdown")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for DNS and metrics shutdown")
 	}
+	assertListenersClosed(t, filter.Config.ListenAddr, filter.Config.MetricsAddr)
 }
 
 func TestNewDNSFilter_ConfigurationErrors(t *testing.T) {
@@ -176,8 +192,7 @@ func TestNewDNSFilter_ConfigurationErrors(t *testing.T) {
 	}
 }
 
-func TestRun_StartupError(t *testing.T) {
-	// Use an invalid port to trigger listener error
+func TestNewDNSFilterRejectsInvalidListener(t *testing.T) {
 	configContent := `
 listen_addr: "127.0.0.1:999999" 
 resolver_unfiltered:
@@ -188,47 +203,128 @@ resolver_unfiltered:
 	configFile := filepath.Join(tmpDir, "config.yml")
 	_ = os.WriteFile(configFile, []byte(configContent), 0644)
 
-	filter, _ := NewDNSFilter(configFile, "")
-
-	err := filter.Run()
-	if err == nil {
-		t.Error("Expected error starting with invalid port")
+	if _, err := NewDNSFilter(configFile, ""); err == nil {
+		t.Error("Expected invalid listener to be rejected before starting")
 	}
 }
 
 func TestRun_SignalShutdown(t *testing.T) {
-	port, _ := GetFreePort()
-	configContent := fmt.Sprintf(`
-listen_addr: "127.0.0.1:%d"
-resolver_unfiltered:
-  addr: "1.1.1.1:53"
-  name: "dummy"
-`, port)
+	for _, sig := range []os.Signal{os.Interrupt, syscall.SIGTERM} {
+		t.Run(sig.String(), func(t *testing.T) {
+			ports := getFreeTestPorts(t, 2)
+			dnsPort, metricsPort := ports[0], ports[1]
+			filter := &DNSFilter{
+				Config: &Config{ListenAddr: fmt.Sprintf("127.0.0.1:%d", dnsPort), MetricsAddr: fmt.Sprintf("127.0.0.1:%d", metricsPort)},
+				Cache:  NewDNSCache(10, 1), stats: &Stats{},
+			}
+			done := make(chan error, 1)
+			go func() { done <- filter.Run() }()
+			waitForHealth(t, filter.Config.MetricsAddr)
+			proc, err := os.FindProcess(os.Getpid())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := proc.Signal(sig); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("signal did not stop all servers")
+			}
+			assertListenersClosed(t, filter.Config.ListenAddr, filter.Config.MetricsAddr)
+		})
+	}
+}
 
-	tmpDir := t.TempDir()
-	configFile := filepath.Join(tmpDir, "config.yml")
-	_ = os.WriteFile(configFile, []byte(configContent), 0644)
-
-	filter, _ := NewDNSFilter(configFile, "")
-
-	errCh := make(chan error)
-	go func() {
-		errCh <- filter.Run()
-	}()
-
-	// Allow to start
-	time.Sleep(100 * time.Millisecond)
-
-	// Send SIGINT
-	proc, _ := os.FindProcess(os.Getpid())
-	proc.Signal(syscall.SIGINT)
-
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Errorf("Expected nil error on graceful shutdown, got: %v", err)
+func waitForHealth(t *testing.T, addr string) {
+	t.Helper()
+	client := &http.Client{Timeout: 100 * time.Millisecond}
+	defer client.CloseIdleConnections()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := client.Get("http://" + addr + "/health")
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return
+			}
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Timed out waiting for shutdown")
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("health endpoint %s did not become ready", addr)
+}
+
+func assertListenersClosed(t *testing.T, dnsAddr, metricsAddr string) {
+	t.Helper()
+	udp, err := net.ListenPacket("udp", dnsAddr)
+	if err != nil {
+		t.Fatalf("UDP port still occupied after shutdown: %v", err)
+	}
+	udp.Close()
+	for _, addr := range []string{dnsAddr, metricsAddr} {
+		tcp, err := net.Listen("tcp", addr)
+		if err != nil {
+			t.Fatalf("TCP port %s still occupied after shutdown: %v", addr, err)
+		}
+		tcp.Close()
+	}
+}
+
+func TestRunContextBindFailuresReleaseListeners(t *testing.T) {
+	for _, blocked := range []string{"tcp", "udp", "metrics"} {
+		t.Run(blocked, func(t *testing.T) {
+			ports := getFreeTestPorts(t, 2)
+			dnsPort, metricsPort := ports[0], ports[1]
+			filter := &DNSFilter{
+				Config: &Config{ListenAddr: fmt.Sprintf("127.0.0.1:%d", dnsPort), MetricsAddr: fmt.Sprintf("127.0.0.1:%d", metricsPort)},
+				Cache:  NewDNSCache(10, 1), stats: &Stats{},
+			}
+			var closeOccupied func() error
+			if blocked == "udp" {
+				conn, err := net.ListenPacket("udp", filter.Config.ListenAddr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				closeOccupied = conn.Close
+			} else {
+				addr := filter.Config.ListenAddr
+				if blocked == "metrics" {
+					addr = filter.Config.MetricsAddr
+				}
+				listener, err := net.Listen("tcp", addr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				closeOccupied = listener.Close
+			}
+			defer closeOccupied()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- filter.RunContext(ctx) }()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("expected a bind error")
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("bind failure left RunContext blocked")
+			}
+			closeOccupied()
+			assertListenersClosed(t, filter.Config.ListenAddr, filter.Config.MetricsAddr)
+		})
+	}
+}
+
+func TestRunContextAlreadyCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	filter := &DNSFilter{Config: &Config{ListenAddr: "invalid"}}
+	if err := filter.RunContext(ctx); err != nil {
+		t.Fatal(err)
 	}
 }

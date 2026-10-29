@@ -1,0 +1,234 @@
+---
+- name: Create private staging directory on the binary filesystem
+  become: yes
+  tempfile:
+    state: directory
+    path: "{{ target_bin | dirname }}"
+    prefix: .dnsfilter-deploy-
+  register: deployment_stage
+
+- name: Initialize deployment state
+  set_fact:
+    deployment_live_changes: false
+    deployment_activation_attempted: false
+    deployment_succeeded: false
+    deployment_rollback_succeeded: false
+    deployment_files:
+      - {name: binary, path: "{{ target_bin }}"}
+      - {name: config, path: "{{ target_config }}"}
+      - {name: unit, path: "{{ target_service_file }}"}
+      - {name: resolver, path: "{{ target_resolv_conf }}"}
+    deployment_validator: "{{ deployment_stage.path + '/candidate' if 'binary' in deployment_components else target_bin }}"
+
+- name: Stage, validate, activate and verify deployment
+  become: yes
+  block:
+    - name: Stage candidate binary
+      copy:
+        src: "{{ local_binary_path }}"
+        dest: "{{ deployment_stage.path }}/candidate"
+        mode: "0755"
+      when: "'binary' in deployment_components"
+
+    - name: Stage candidate configuration
+      copy:
+        src: "{{ local_config_path if 'config' in deployment_components else target_config }}"
+        dest: "{{ deployment_stage.path }}/config.yml"
+        remote_src: "{{ 'config' not in deployment_components }}"
+        mode: "0600"
+
+    - name: Validate candidate configuration without opening listeners
+      command:
+        argv: ["{{ deployment_validator }}", -checkConfig, -configFile, "{{ deployment_stage.path }}/config.yml"]
+      register: deployment_validation
+      changed_when: false
+
+    - name: Record DNS readiness address
+      set_fact:
+        deployment_probe_address: "{{ (deployment_validation.stdout | from_json).listen_addr }}"
+
+    - name: Inspect previous files without following symlinks
+      stat:
+        path: "{{ item.path }}"
+        follow: false
+      loop: "{{ deployment_files }}"
+      register: deployment_previous_files
+
+    - name: Preserve previous files, symlinks, ownership and capabilities
+      command:
+        argv: [cp, -a, --, "{{ item.item.path }}", "{{ deployment_stage.path }}/previous-{{ item.item.name }}"]
+      loop: "{{ deployment_previous_files.results }}"
+      when: item.stat.exists
+      changed_when: false
+
+    - name: Inspect previous service states
+      service_facts:
+
+    - name: Remember previous service states
+      set_fact:
+        deployment_previous_service: "{{ ansible_facts.services.get(service_name + '.service', {}) }}"
+        deployment_previous_resolved: "{{ ansible_facts.services.get('systemd-resolved.service', {}) }}"
+
+    - name: Mark start of live changes
+      set_fact:
+        deployment_live_changes: true
+
+    - name: Bootstrap DNS for package installation
+      copy:
+        content: "nameserver 1.1.1.1\n"
+        dest: "{{ target_resolv_conf }}"
+        mode: "0644"
+      when: "'bootstrap' in deployment_components"
+
+    - name: Install required system packages
+      package:
+        name: [ufw, libcap2-bin]
+        state: present
+        update_cache: yes
+      when: "'bootstrap' in deployment_components"
+
+    - name: Create service group
+      group:
+        name: "{{ service_group }}"
+        state: present
+      when: "'setup' in deployment_components"
+
+    - name: Create service user
+      user:
+        name: "{{ service_user }}"
+        group: "{{ service_group }}"
+        system: yes
+        shell: /bin/false
+        create_home: no
+      when: "'setup' in deployment_components"
+
+    - name: Stop conflicting system resolver
+      systemd:
+        name: systemd-resolved
+        state: stopped
+        enabled: no
+      when: "'system' in deployment_components and deployment_previous_resolved | length > 0"
+
+    - name: Prepare new binary for atomic replacement
+      copy:
+        src: "{{ deployment_stage.path }}/candidate"
+        dest: "{{ deployment_stage.path }}/install"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      when: "'binary' in deployment_components"
+
+    - name: Grant privileged DNS port capability before activation
+      command:
+        argv: [setcap, "cap_net_bind_service=+ep", "{{ deployment_stage.path }}/install"]
+      when: "'binary' in deployment_components"
+
+    - name: Atomically activate new binary
+      command:
+        argv: [mv, -Tf, --, "{{ deployment_stage.path }}/install", "{{ target_bin }}"]
+      when: "'binary' in deployment_components"
+
+    - name: Activate validated configuration
+      copy:
+        src: "{{ deployment_stage.path }}/config.yml"
+        dest: "{{ target_config }}"
+        remote_src: true
+        owner: root
+        group: "{{ service_group }}"
+        mode: "0640"
+      when: "'config' in deployment_components"
+
+    - name: Install or update managed systemd unit
+      template:
+        src: "{{ playbook_dir }}/templates/dns-filter.service.j2"
+        dest: "{{ target_service_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+      when: "'binary' in deployment_components"
+
+    - name: Configure WireGuard DNS firewall rules
+      community.general.ufw:
+        rule: allow
+        direction: in
+        interface: wg0
+        port: "53"
+        proto: "{{ item }}"
+      loop: [udp, tcp]
+      when: "'firewall' in deployment_components and wg_enabled | bool"
+
+    - name: Mark service activation attempt
+      set_fact:
+        deployment_activation_attempted: true
+
+    - name: Activate service before checking DNS
+      systemd:
+        name: "{{ service_name }}"
+        state: "{{ 'restarted' if ('binary' in deployment_components or 'config' in deployment_components) else 'started' }}"
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Verify DNS over both UDP and TCP
+      command:
+        argv: ["{{ target_bin }}", -checkDNS, "{{ deployment_probe_address }}"]
+      register: deployment_probe
+      until: deployment_probe.rc == 0
+      retries: "{{ deployment_probe_retries }}"
+      delay: "{{ deployment_probe_delay }}"
+      changed_when: false
+
+    - name: Verify loopback port 53 before selecting local system DNS
+      command:
+        argv: ["{{ target_bin }}", -checkDNS, "127.0.0.1:53"]
+      when: "'dns' in deployment_components and use_local_dns | bool"
+      changed_when: false
+
+    - name: Verify that this service remains active after DNS checks
+      systemd:
+        name: "{{ service_name }}"
+      register: deployment_service_status
+      failed_when: >-
+        deployment_service_status.status.ActiveState | default('') != 'active'
+        or deployment_service_status.status.SubState | default('') != 'running'
+      changed_when: false
+
+    - name: Configure system DNS only after successful DNS checks
+      copy:
+        content: "{{ 'nameserver 127.0.0.1\n' if use_local_dns | bool else 'nameserver 1.1.1.2\n' }}"
+        dest: "{{ target_resolv_conf }}"
+        mode: "0644"
+      when: "'dns' in deployment_components"
+
+    - name: Mark successful deployment
+      set_fact:
+        deployment_succeeded: true
+
+  rescue:
+    - name: Remember deployment error
+      set_fact:
+        deployment_failure: "{{ ansible_failed_result.msg | default('deployment task failed') }}"
+
+    - name: Restore previous deployment after live changes
+      when: deployment_live_changes | bool
+      block:
+        - name: Roll back files and services
+          import_tasks: rollback.yml
+        - name: Mark completed rollback
+          set_fact:
+            deployment_rollback_succeeded: true
+      rescue:
+        - name: Report incomplete rollback and preserve recovery files
+          fail:
+            msg: "Deployment failed and rollback was incomplete. Recovery files remain in {{ deployment_stage.path }}. Original error: {{ deployment_failure }}"
+
+    - name: Report rejected deployment
+      fail:
+        msg: "{{ 'Previous deployment restored.' if deployment_rollback_succeeded else 'Rejected before live changes.' }} {{ deployment_failure }}"
+
+  always:
+    - name: Remove staging files after success or completed recovery
+      file:
+        path: "{{ deployment_stage.path }}"
+        state: absent
+      when: deployment_succeeded or deployment_rollback_succeeded or not deployment_live_changes

@@ -29,3 +29,10 @@ go.work
 
 *_linux
 ui/bundled.go
+
+# Python deployment tests
+__pycache__/
+
+# Local container builds and deployment targets
+/build/
+/deploy.yaml

@@ -1,0 +1,77 @@
+---
+- name: Stop failed service and undo newly enabled startup
+  systemd:
+    name: "{{ service_name }}"
+    state: stopped
+    enabled: "{{ deployment_previous_service.status | default('disabled') == 'enabled' }}"
+  when: deployment_activation_attempted | bool
+  ignore_errors: yes
+
+- name: Prepare previous files alongside their destinations
+  command:
+    argv:
+      - cp
+      - -a
+      - --
+      - "{{ deployment_stage.path }}/previous-{{ item.item.name }}"
+      - "{{ item.item.path }}.{{ deployment_stage.path | basename }}"
+  loop: "{{ deployment_previous_files.results }}"
+  when: item.stat.exists
+
+- name: Atomically restore previous files and symlinks
+  command:
+    argv: [mv, -Tf, --, "{{ item.item.path }}.{{ deployment_stage.path | basename }}", "{{ item.item.path }}"]
+  loop: "{{ deployment_previous_files.results }}"
+  when: item.stat.exists
+
+- name: Remove files that did not exist before deployment
+  file:
+    path: "{{ item.item.path }}"
+    state: absent
+  loop: "{{ deployment_previous_files.results }}"
+  when: not item.stat.exists
+
+- name: Reload restored service definitions
+  systemd:
+    daemon_reload: yes
+
+- name: Restore previous system resolver state
+  systemd:
+    name: systemd-resolved
+    state: "{{ 'started' if deployment_previous_resolved.state == 'running' else 'stopped' }}"
+    enabled: "{{ deployment_previous_resolved.status | default('disabled') == 'enabled' }}"
+  when: "'system' in deployment_components and deployment_previous_resolved | length > 0"
+
+- name: Restore previous DNS service state
+  systemd:
+    name: "{{ service_name }}"
+    state: "{{ 'restarted' if deployment_previous_service.state == 'running' else 'stopped' }}"
+    enabled: "{{ deployment_previous_service.status | default('disabled') == 'enabled' }}"
+  when: deployment_activation_attempted and deployment_previous_service | length > 0
+
+- name: Inspect restored configuration for readiness verification
+  command:
+    argv: ["{{ deployment_validator }}", -checkConfig, -configFile, "{{ target_config }}"]
+  register: deployment_restored_config
+  when: deployment_activation_attempted and deployment_previous_service.state | default('') == 'running'
+  changed_when: false
+
+- name: Verify DNS after restoring the previous running service
+  command:
+    argv: ["{{ deployment_validator }}", -checkDNS, "{{ (deployment_restored_config.stdout | from_json).listen_addr }}"]
+  register: deployment_restored_probe
+  until: deployment_restored_probe.rc == 0
+  retries: "{{ deployment_probe_retries }}"
+  delay: "{{ deployment_probe_delay }}"
+  when: deployment_activation_attempted and deployment_previous_service.state | default('') == 'running'
+  changed_when: false
+
+- name: Verify restored service is active
+  systemd:
+    name: "{{ service_name }}"
+  register: deployment_restored_status
+  failed_when: >-
+    deployment_restored_status.status.ActiveState | default('') != 'active'
+    or deployment_restored_status.status.SubState | default('') != 'running'
+  when: deployment_activation_attempted and deployment_previous_service.state | default('') == 'running'
+  changed_when: false

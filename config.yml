@@ -1,7 +1,15 @@
 listen_addr: 0.0.0.0:53
-metrics_addr: 0.0.0.0:8080 # New: Prometheus-style metrics & health check
+metrics_addr: 127.0.0.1:8080 # JSON metrics & health check, local access only
 request_timeout: 4s
 cache_size: 10000          # New: Max number of cached DNS responses
+
+# Loopback is always allowed. Restrict these networks to your VPN/LAN subnets.
+# If omitted or empty, only loopback clients are accepted.
+allowed_clients:
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+  - fc00::/7
 
 filter_malware: true
 filter_porn: true

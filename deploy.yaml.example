@@ -1,0 +1,48 @@
+# Copy to deploy.yaml and adjust the SSH target and target architecture.
+# Requires dryaf/deploy: https://github.com/dryaf/deploy
+app_name: dnsfilter
+deployment:
+  mode: binary
+binary_name: dns-filter
+build:
+  dir: ./service
+  arch: amd64
+  ldflags: "-s -w"
+artifacts:
+  include:
+    - Containerfile
+    - .dockerignore
+    - config.yml
+
+environments:
+  production:
+    host: dns.example.com
+    user: deploy
+    ssh_port: 22
+    target_dir: /home/deploy/apps/dnsfilter
+    quadlet:
+      service_name: dns-filter
+      description: DNS filtering proxy
+      image: localhost/dnsfilter:production
+      dockerfile: Containerfile
+      exec: /dns-filter -configFile /etc/dnsfilter.yml
+      env_file: ""
+      # Host networking preserves client addresses for allowed_clients.
+      # Rootless port 53 requires ip_unprivileged_port_start <= 53 on the host.
+      network: host
+      router:
+        enabled: false
+      volumes:
+        - ./config.yml:/etc/dnsfilter.yml:ro,Z
+      read_only: true
+      auto_restart: true
+      podman_args:
+        # Map the SSH user's UID/GID to the image user so private configs work.
+        - --userns=keep-id:uid=65532,gid=65532
+        - --cap-drop=all
+        - --security-opt=no-new-privileges
+      # Keep this address in sync with listen_addr in config.yml.
+      # Podman's explicit CMD prefix runs the executable without a shell.
+      health_cmd: CMD /dns-filter -checkDNS 0.0.0.0:53
+      health_required: true
+      health_timeout: 30s

@@ -4,13 +4,14 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/miekg/dns"
-	"golang.org/x/exp/slog"
 )
 
 func TestResolver_LoadAndValidate(t *testing.T) {
@@ -79,8 +80,15 @@ func TestResolver_DoH_Integration(t *testing.T) {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		if r.Header.Get("Content-Type") != "application/dns-udpwireformat" {
+		if r.Header.Get("Content-Type") != "application/dns-message" {
 			t.Errorf("Unexpected Content-Type: %s", r.Header.Get("Content-Type"))
+			w.WriteHeader(http.StatusUnsupportedMediaType)
+			return
+		}
+		if r.Header.Get("Accept") != "application/dns-message" {
+			t.Errorf("Unexpected Accept: %s", r.Header.Get("Accept"))
+			w.WriteHeader(http.StatusNotAcceptable)
+			return
 		}
 
 		body, _ := io.ReadAll(r.Body)
@@ -96,7 +104,7 @@ func TestResolver_DoH_Integration(t *testing.T) {
 		})
 
 		packed, _ := respMsg.Pack()
-		w.Header().Set("Content-Type", "application/dns-udpwireformat")
+		w.Header().Set("Content-Type", "application/dns-message")
 		w.Write(packed)
 	}))
 	defer ts.Close()
@@ -195,7 +203,7 @@ func TestResolver_RequestCreationError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err := r.makeHttpsRequest(ctx, badMsg, slog.Default())
+	_, err := r.makeHTTPSRequest(ctx, badMsg, slog.Default())
 	if err == nil {
 		t.Error("Expected error with cancelled context")
 	}
@@ -240,5 +248,223 @@ func TestResolver_NilResponse(t *testing.T) {
 	_, _, err := r.resolve(context.Background(), q, slog.Default())
 	if err == nil || err.Error() != "resolver returned nil response" {
 		t.Errorf("Expected 'resolver returned nil response', got %v", err)
+	}
+}
+
+func newTestDoHResolver(t *testing.T, handler func(*dns.Msg) *dns.Msg, responseHeaders ...http.Header) *Resolver {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Content-Type") != "application/dns-message" || r.Header.Get("Accept") != "application/dns-message" {
+			w.WriteHeader(http.StatusUnsupportedMediaType)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		query := new(dns.Msg)
+		if err := query.Unpack(body); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		wire, err := handler(query).Pack()
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/dns-message")
+		for _, headers := range responseHeaders {
+			for name, values := range headers {
+				w.Header()[name] = values
+			}
+		}
+		_, _ = w.Write(wire)
+	}))
+	t.Cleanup(server.Close)
+	resolver := &Resolver{Addr: server.Listener.Addr().String(), URL: server.URL}
+	if err := resolver.LoadAndValidate(true); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(resolver.httpsClient.CloseIdleConnections)
+	return resolver
+}
+
+func TestDoHAccountsForHTTPAge(t *testing.T) {
+	for _, tc := range []struct {
+		age       string
+		ttls      [3]uint32
+		wantError bool
+	}{
+		{"", [3]uint32{60, 30, 10}, false},
+		{"1", [3]uint32{59, 29, 9}, false},
+		{"59", [3]uint32{1, 0, 0}, false},
+		{"60", [3]uint32{}, false},
+		{"4294967296", [3]uint32{}, false},
+		{"18446744073709551615", [3]uint32{}, false},
+		{"18446744073709551616", [3]uint32{}, true},
+		{"-1", [3]uint32{}, true},
+		{"invalid", [3]uint32{}, true},
+	} {
+		t.Run("age="+tc.age, func(t *testing.T) {
+			resolver := newTestDoHResolver(t, func(query *dns.Msg) *dns.Msg {
+				reply, _ := handlerPass(query)
+				reply.Ns = []dns.RR{&dns.NS{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 30}, Ns: "ns.example.com."}}
+				reply.Extra = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: "ns.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("192.0.2.1")}}
+				reply.SetEdns0(1232, true)
+				return reply
+			}, http.Header{"Age": []string{tc.age}})
+			query := new(dns.Msg).SetQuestion("example.com.", dns.TypeA)
+			query.SetEdns0(1232, true)
+			reply, _, err := resolver.resolve(context.Background(), query, slog.Default())
+			if tc.wantError {
+				if err == nil {
+					t.Fatal("accepted invalid Age")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := [3]uint32{reply.Answer[0].Header().Ttl, reply.Ns[0].Header().Ttl, reply.Extra[0].Header().Ttl}
+			if got != tc.ttls {
+				t.Errorf("TTL=%v, want=%v", got, tc.ttls)
+			}
+			if opt := reply.IsEdns0(); opt == nil || !opt.Do() || opt.UDPSize() != 1232 {
+				t.Fatalf("Age changed EDNS: %v", opt)
+			}
+			if tc.age == "59" {
+				cache := NewDNSCache(10, 10)
+				key := cache.GenerateRequestKey(query)
+				cache.Set(key, reply)
+				if cache.Get(key) != nil {
+					t.Error("expired records entered the DNS cache")
+				}
+			}
+		})
+	}
+}
+
+func TestResolverDoHPreservesResponse(t *testing.T) {
+	for _, rcode := range []int{dns.RcodeSuccess, dns.RcodeNameError, dns.RcodeServerFailure, dns.RcodeRefused} {
+		t.Run(dns.RcodeToString[rcode], func(t *testing.T) {
+			resolver := newTestDoHResolver(t, func(query *dns.Msg) *dns.Msg {
+				reply := new(dns.Msg).SetRcode(query, rcode)
+				reply.Id = 0
+				reply.Authoritative = true
+				reply.RecursionAvailable = true
+				reply.AuthenticatedData = true
+				return reply
+			})
+			query := new(dns.Msg).SetQuestion("example.com.", dns.TypeA)
+			query.Id = 1234
+			reply, filtered, err := resolver.resolve(context.Background(), query, slog.Default())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reply.Rcode != rcode || reply.Id != query.Id {
+				t.Errorf("upstream status or request ID changed: %v", reply.MsgHdr)
+			}
+			if !reply.Authoritative || !reply.RecursionAvailable || !reply.AuthenticatedData {
+				t.Errorf("response flags changed: %v", reply.MsgHdr)
+			}
+			if filtered != (rcode == dns.RcodeNameError) {
+				t.Errorf("filtered=%v for %s", filtered, dns.RcodeToString[rcode])
+			}
+		})
+	}
+}
+
+func TestDoHAdsNXDOMAINBlocksPrimaryAnswer(t *testing.T) {
+	ads := newTestDoHResolver(t, func(query *dns.Msg) *dns.Msg {
+		return new(dns.Msg).SetRcode(query, dns.RcodeNameError)
+	})
+	filter := &DNSFilter{
+		Config: &Config{FilterAds: true, Resolvers: map[string]*Resolver{
+			"resolver_unfiltered": {dnsClient: &mockDNSClient{Handler: handlerPass}},
+			"resolver_anti_ads":   ads,
+		}},
+		stats: &Stats{},
+	}
+	reply, err := filter.ResolveDomain(context.Background(), "example.com.", 1234, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.Rcode != dns.RcodeNameError || atomic.LoadUint64(&filter.stats.BlockedTotal) != 1 {
+		t.Fatalf("ads NXDOMAIN did not block the primary answer: %v", reply)
+	}
+}
+
+func TestResolverPreservesEDNS(t *testing.T) {
+	for _, name := range []string{"legacy", "edns", "dnssec"} {
+		t.Run(name, func(t *testing.T) {
+			query := new(dns.Msg).SetQuestion("example.com.", dns.TypeAAAA)
+			if name != "legacy" {
+				query.SetEdns0(1232, name == "dnssec")
+			}
+			resolver := newTestDoHResolver(t, func(upstream *dns.Msg) *dns.Msg {
+				if len(upstream.Extra) != len(query.Extra) {
+					t.Errorf("upstream EDNS count=%d, want %d", len(upstream.Extra), len(query.Extra))
+				}
+				reply := new(dns.Msg).SetReply(upstream)
+				if opt := upstream.IsEdns0(); opt != nil {
+					if opt.UDPSize() != 1232 || opt.Do() != (name == "dnssec") {
+						t.Errorf("upstream EDNS changed: %v", opt)
+					}
+					reply.SetEdns0(opt.UDPSize(), opt.Do())
+				}
+				return reply
+			})
+			reply, _, err := resolver.resolve(context.Background(), query, slog.Default())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(reply.Extra) != len(query.Extra) {
+				t.Fatalf("response EDNS count=%d, want %d", len(reply.Extra), len(query.Extra))
+			}
+			if opt := reply.IsEdns0(); opt != nil && (opt.UDPSize() != 1232 || opt.Do() != (name == "dnssec")) {
+				t.Errorf("response EDNS changed: %v", opt)
+			}
+		})
+	}
+}
+
+func TestResolverBlocksUnspecifiedAddresses(t *testing.T) {
+	for _, record := range []string{"example.com. 60 IN A 0.0.0.0", "example.com. 60 IN AAAA ::"} {
+		t.Run(record, func(t *testing.T) {
+			rr, err := dns.NewRR(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resolver := &Resolver{dnsClient: &mockDNSClient{Handler: func(query *dns.Msg) (*dns.Msg, error) {
+				reply := new(dns.Msg).SetReply(query)
+				reply.Answer = []dns.RR{rr}
+				return reply, nil
+			}}}
+			_, filtered, err := resolver.resolve(context.Background(), new(dns.Msg).SetQuestion(rr.Header().Name, rr.Header().Rrtype), slog.Default())
+			if err != nil || !filtered {
+				t.Errorf("filtered=%v, error=%v", filtered, err)
+			}
+		})
+	}
+}
+
+func TestDoHDialHonorsCancellation(t *testing.T) {
+	resolver := &Resolver{Addr: "192.0.2.1:443", URL: "https://resolver.example/dns-query"}
+	if err := resolver.LoadAndValidate(false); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	conn, err := resolver.httpsClient.Transport.(*http.Transport).DialContext(ctx, "tcp", "resolver.example:443")
+	if conn != nil {
+		conn.Close()
+		t.Error("cancelled dial opened a connection")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("dial ignored cancellation: %v", err)
 	}
 }
